@@ -160,6 +160,15 @@ class VirtualProfileTest(unittest.TestCase):
             self.assertEqual(len(store.list_for_model("usb:046d:c08d:0")), 1)
             self.assertEqual(len(json.loads(path.read_text())["profiles"]), 2)
 
+    def test_migration_skips_names_already_saved_on_g502_x(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = VirtualProfileStore(Path(directory) / "virtual_profiles.json")
+            store.save("DayZ", "usb:046d:407f:0", FakeProfile())
+            native = store.save("DayZ", "usb:046d:409f:0", FakeProfile())
+            store.migrate_g502_profiles()
+
+            self.assertEqual(store.list_for_model("usb:046d:409f:0"), [native])
+
     def test_old_g502_profile_keeps_its_lighting(self):
         source = FakeProfile()
         source.leds[0].color = (1, 2, 3)

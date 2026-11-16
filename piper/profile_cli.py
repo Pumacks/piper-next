@@ -85,12 +85,16 @@ def _matching_onboard_profiles(device, selector: str, names: ProfileNameStore):
 
 def _matching_virtual_profiles(device, selector: str, store: VirtualProfileStore):
     needle = selector.casefold()
-    return [
+    matches = [
         profile
         for profile in store.list_for_model(device.model)
         if isinstance(profile.get("name"), str)
         and profile["name"].casefold() == needle
     ]
+    # A profile saved on this mouse wins over a copy migrated from an older
+    # model that happens to share its name.
+    native = [profile for profile in matches if "migrated_from_id" not in profile]
+    return native or matches
 
 
 def activate_profile(

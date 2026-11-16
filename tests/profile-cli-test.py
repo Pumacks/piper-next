@@ -115,6 +115,24 @@ class ProfileCliTest(unittest.TestCase):
         self.assertEqual(device.commit_count, 1)
         self.assertEqual(message, "Loaded virtual profile 'My Game' into slot 1")
 
+    def test_native_virtual_profile_wins_over_migrated_copy(self):
+        device = FakeDevice()
+        names = FakeNames()
+        native = virtual_profile("DayZ")
+        migrated = virtual_profile("DayZ")
+        migrated["migrated_from_id"] = "old-id"
+        migrated["settings"] = None  # would fail to apply if chosen
+
+        message = activate_profile(
+            device,
+            "DayZ",
+            names,
+            FakeVirtualProfiles([migrated, native]),
+            virtual_only=True,
+        )
+
+        self.assertEqual(message, "Loaded virtual profile 'DayZ' into slot 1")
+
     def test_onboard_profile_wins_name_collision_by_default(self):
         device = FakeDevice()
         names = FakeNames({1: "Gaming"})

@@ -61,11 +61,17 @@ class VirtualProfileStore:
     def migrate_g502_profiles(self) -> None:
         profiles = self._load()
         migrated_ids = {p.get("migrated_from_id") for p in profiles}
+        target_names = {
+            p.get("name")
+            for p in profiles
+            if _profile_model(p.get("device_model")) == G502_X_PROFILE_MODEL
+        }
         copies = []
         for source in profiles:
             if (
                 source.get("device_model") not in G502_OLD_MODELS
                 or source.get("id") in migrated_ids
+                or source.get("name") in target_names
             ):
                 continue
             copy = deepcopy(source)
