@@ -144,6 +144,54 @@ Supported devices are determined by libratbag. See the
 [libratbag device database](https://github.com/libratbag/libratbag/tree/master/data/devices)
 for the upstream list.
 
+## Logitech G502 X LIGHTSPEED and other mice that need a patched ratbagd
+
+Some newer Logitech mice are not handled by the libratbag that distributions
+ship. The G502 X LIGHTSPEED (wireless `usb:046d:409f`, wired `usb:046d:c098`)
+is one of them: it reports onboard-profile format `0x0a` and uses the HID++
+features 0x2202 (Extended Adjustable DPI) and 0x8061 (Extended Adjustable
+Report Rate), so stock `ratbagd` logs `Profile layout not supported: 0x0a` and
+never lists the mouse.
+
+This repository carries the required libratbag changes as patches in
+`tools/libratbag-patches/`. The helper below builds libratbag with them and
+installs only a second daemon binary, `/usr/local/libexec/ratbagd-piper`, plus
+the patched device database under `/usr/local/share/libratbag`. A systemd
+drop-in points the existing `ratbagd.service` at that binary; files owned by
+your distribution package are not modified.
+
+```sh
+git clone https://github.com/libratbag/libratbag.git ~/Applications/libratbag
+tools/install-ratbagd-piper.sh            # or: tools/install-ratbagd-piper.sh /path/to/libratbag
+ratbagctl list
+```
+
+The build runs as your user; only the final copy and the service restart use
+`sudo`. Re-run the script after updating the libratbag checkout or the
+patches. To go back to the packaged daemon, remove
+`/etc/systemd/system/ratbagd.service.d/piper-override.conf` and run
+`sudo systemctl daemon-reload && sudo systemctl restart ratbagd`.
+
+The patches also make `ratbagd` rescan for wireless mice that wake up after
+the daemon started, which is why a sleeping G502 can take up to 30 seconds to
+appear.
+
+They also teach libratbag to store real multi-step macros in the mouse's
+onboard macro memory, including the device-side flow control commands
+(*wait for release*, *repeat while held*, *repeat until pressed again*). Piper
+Next uses this for **Hold a key until pressed again…** in a button's
+assignment list: one press holds a keyboard key or a mouse button (click the
+box in the dialog with it), the next press releases it. Recorded macros may
+contain mouse clicks as well. Stock libratbag only writes macros that boil
+down to a single key with modifiers.
+
+They also add a `FactoryReset` D-Bus method. Piper Next shows it as
+**Onboard memory → Factory reset** on the device page: the mouse's onboard
+profiles are overwritten with the factory (ROM) defaults, unapplied changes
+are dropped and local profile names for that mouse are forgotten. Virtual
+profiles in your library are untouched. With a stock `ratbagd` the button
+reports that the daemon lacks the method.
+
 ## Build and run the modern GTK4 interface
 
 Clone this fork:
@@ -220,31 +268,35 @@ onboard and virtual profile names with:
 ~/.local/bin/piper-profile --list
 ```
 
-In a game's **Properties → Launch Options** field in Steam, use:
+The easiest way to get the launch option is Piper Next: open the virtual
+profile menu of a slot and press the copy icon next to a virtual profile. The
+clipboard then holds a ready-made line such as
 
 ```sh
-~/.local/bin/piper-profile --profile "Gaming" -- %command%
+/home/you/.local/bin/piper-profile --device 'usb:046d:409f:0' --profile 'DayZ' --virtual --restore 'Desktop' -- %command%
 ```
 
-An onboard profile can also be selected by its one-based slot number. When an
-onboard and virtual profile share a name, the onboard profile is selected by
-default; add `--virtual` to load the virtual one. Virtual profiles replace the
-active onboard slot by default; use `--slot N` to choose another slot explicitly:
+Paste it into the game's **Properties → Launch Options** field in Steam. The
+pieces:
 
-```sh
-~/.local/bin/piper-profile --profile "My Game" --virtual --slot 2 -- %command%
-```
-
-When more than one supported mouse connection is present, select one with a
-substring of its name or model:
-
-```sh
-~/.local/bin/piper-profile --device "usb:046d:407f:0" --profile "Gaming" -- %command%
-```
+- `--profile NAME` loads the profile when the game starts. Onboard profiles
+  can also be selected by their one-based slot number. When an onboard and a
+  virtual profile share a name the onboard one wins; `--virtual` picks the
+  virtual one. Virtual profiles replace the active onboard slot; `--slot N`
+  chooses another slot.
+- `--restore NAME` switches back to that profile when the game exits. The copy
+  button fills it in automatically when a virtual profile is called
+  "Desktop" (or "Default").
+- `--device TEXT` is required when more than one mouse is connected (for
+  example a G502 and a G502 X); any substring of the name, model or ID works.
+  The copy button inserts the model of the mouse you are editing.
+- `--wait SECONDS` (default 45) keeps retrying while ratbagd starts or a
+  wireless mouse is still waking up. The game is started immediately and the
+  profile is switched alongside it, so a sleeping mouse never delays the
+  launch. Add `--strict` to launch the game only after a successful switch.
 
 Profile errors are printed to Steam's launch log but do not prevent the game
-from starting. Add `--strict` if the game should only launch after a successful
-profile switch.
+from starting.
 
 ## Development
 

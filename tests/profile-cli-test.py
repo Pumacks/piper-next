@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from piper.profile_cli import (  # noqa: E402
     activate_profile,
     list_profiles,
     select_device,
+    switch_with_retry,
 )
 
 
@@ -148,6 +150,69 @@ class ProfileCliTest(unittest.TestCase):
 
         self.assertIn("* 1: Desktop", output)
         self.assertIn("My Game", output)
+
+    def test_parser_accepts_restore_and_wait(self):
+        args = _parser().parse_args(
+            ["--profile", "DayZ", "--virtual", "--restore", "Desktop", "--wait", "9", "--", "game"]
+        )
+
+        self.assertEqual(args.restore, "Desktop")
+        self.assertEqual(args.wait, 9.0)
+        self.assertEqual(args.command, ["--", "game"])
+
+    def test_switch_retries_until_the_mouse_shows_up(self):
+        device = FakeDevice()
+        attempts = []
+
+        def open_device():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise ProfileCliError("No supported mouse was found")
+            return device
+
+        clock = [0.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        args = _parser().parse_args(["--profile", "2"])
+        with tempfile.TemporaryDirectory() as directory:
+            message = switch_with_retry(
+                "2",
+                args,
+                ratbagd_api_version=2,
+                config_dir=Path(directory),
+                deadline=30.0,
+                monotonic=lambda: clock[0],
+                sleep=sleep,
+                open_device=open_device,
+            )
+
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len(sleeps), 2)
+        self.assertIn("Activated onboard profile", message)
+        self.assertTrue(device.profiles[1].is_active)
+
+    def test_switch_gives_up_when_the_game_already_exited(self):
+        def open_device():
+            raise ProfileCliError("No supported mouse was found")
+
+        args = _parser().parse_args(["--profile", "2"])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ProfileCliError):
+                switch_with_retry(
+                    "2",
+                    args,
+                    ratbagd_api_version=2,
+                    config_dir=Path(directory),
+                    deadline=1000.0,
+                    should_stop=lambda: True,
+                    monotonic=lambda: 0.0,
+                    sleep=lambda _seconds: None,
+                    open_device=open_device,
+                )
 
     def test_parser_keeps_steam_command_after_separator(self):
         args = _parser().parse_args(

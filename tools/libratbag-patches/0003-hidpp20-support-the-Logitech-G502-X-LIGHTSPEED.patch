@@ -1,0 +1,979 @@
+From eceda69ddfd1bb15d27bd803c3945fefb6fd402d Mon Sep 17 00:00:00 2001
+From: DanielBeeck <daniel.beck99@outlook.de>
+Date: Fri, 13 Nov 2026 16:29:31 +0100
+Subject: [PATCH 3/6] hidpp20: support the Logitech G502 X LIGHTSPEED
+
+The G502 X LIGHTSPEED (usb:046d:409f through the LIGHTSPEED receiver,
+usb:046d:c098 wired) was rejected by the hidpp20 driver for three reasons:
+
+- it reports onboard profile format 0x0a. The sector layout verified on
+  the device matches the known G402/G502X layout (255 byte sectors with
+  the CRC in the last two bytes), so accept that format id.
+- it only implements 0x2202 (Extended Adjustable DPI) instead of 0x2201.
+  Add support for the feature: the sensor count, capabilities, the DPI
+  range stream (plain values and 0xe000 | step markers across several
+  replies) and the current DPI parameters. Ranges are kept per sensor
+  and validated with hidpp20_sensor_accepts_dpi().
+- it only implements 0x8061 (Extended Adjustable Report Rate) instead
+  of 0x8060, which left the report rate list empty and made libratbag
+  drop the device. Add the feature; rates are indices for 125 << n Hz.
+  Onboard profiles store milliseconds, so only rates up to 1000Hz are
+  offered on profile based devices.
+
+Also allocate at least 256 bytes for a profile sector so the 256 byte
+hidpp20_internal_profile union never overruns a 255 byte buffer, and
+expose the ROM profiles as enabled when a device has no valid profile
+directory yet, which is what the firmware runs on in that state.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/driver-hidpp20.c | 177 +++++++++++++---
+ src/hidpp20.c        | 477 ++++++++++++++++++++++++++++++++++++++++++-
+ src/hidpp20.h        |  86 +++++++-
+ 3 files changed, 707 insertions(+), 33 deletions(-)
+
+diff --git a/src/driver-hidpp20.c b/src/driver-hidpp20.c
+index 66049b1..b1677da 100644
+--- a/src/driver-hidpp20.c
++++ b/src/driver-hidpp20.c
+@@ -58,6 +58,8 @@
+ #define HIDPP_CAP_ADJUSTABLE_REPORT_RATE_8060		(1 << 8)
+ #define HIDPP_CAP_BATTERY_VOLTAGE_1001			(1 << 9)
+ #define HIDPP_CAP_RGB_EFFECTS_8071			(1 << 10)
++#define HIDPP_CAP_SWITCHABLE_RESOLUTION_2202		(1 << 11)
++#define HIDPP_CAP_ADJUSTABLE_REPORT_RATE_8061		(1 << 12)
+ 
+ #define HIDPP_HIDDEN_FEATURE				(1 << 6)
+ 
+@@ -72,7 +74,7 @@ struct hidpp20drv_data {
+ 	struct hidpp20_led *leds;
+ 	union hidpp20_generic_led_zone_info led_infos;
+ 
+-	unsigned int report_rates[4];
++	unsigned int report_rates[HIDPP20_EXT_REPORT_RATE_COUNT + 1];
+ 	unsigned int num_report_rates;
+ 
+ 	unsigned int num_profiles;
+@@ -781,7 +783,8 @@ hidpp20drv_set_current_profile(struct ratbag_device *device, unsigned int index)
+ }
+ 
+ static int
+-hidpp20drv_read_resolution_dpi_2201(struct ratbag_device *device)
++hidpp20drv_read_resolution_dpi_sensors(struct ratbag_device *device,
++				       uint16_t feature)
+ {
+ 	struct hidpp20drv_data *drv_data = ratbag_get_drv_data(device);
+ 	struct ratbag *ratbag = device->ratbag;
+@@ -790,7 +793,10 @@ hidpp20drv_read_resolution_dpi_2201(struct ratbag_device *device)
+ 	free(drv_data->sensors);
+ 	drv_data->sensors = NULL;
+ 	drv_data->num_sensors = 0;
+-	rc = hidpp20_adjustable_dpi_get_sensors(drv_data->dev, &drv_data->sensors);
++	if (feature == HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI)
++		rc = hidpp20_ext_adjustable_dpi_get_sensors(drv_data->dev, &drv_data->sensors);
++	else
++		rc = hidpp20_adjustable_dpi_get_sensors(drv_data->dev, &drv_data->sensors);
+ 	if (rc < 0) {
+ 		log_error(ratbag,
+ 			  "Error while requesting resolution: %s (%d)\n",
+@@ -882,6 +888,63 @@ hidpp20drv_read_report_rate_8060(struct ratbag_device *device)
+ 	return 0;
+ }
+ 
++static int
++hidpp20drv_read_report_rate_8061(struct ratbag_device *device)
++{
++	struct hidpp20drv_data *drv_data = ratbag_get_drv_data(device);
++	struct ratbag *ratbag = device->ratbag;
++	struct ratbag_profile *profile;
++	uint16_t bitflags;
++	uint8_t rate_index;
++	int nrates = 0;
++	int rc;
++
++	rc = hidpp20_ext_adjustable_report_rate_get_report_rate_list(drv_data->dev,
++								     &bitflags);
++	if (rc < 0)
++		return rc;
++
++	for (rate_index = 0; rate_index < HIDPP20_EXT_REPORT_RATE_COUNT; rate_index++) {
++		if (bitflags & (1 << rate_index))
++			drv_data->report_rates[nrates++] = hidpp20_ext_report_rate_index_to_hz(rate_index);
++	}
++
++	drv_data->num_report_rates = nrates;
++
++	if (!hidpp20_ext_adjustable_report_rate_get_report_rate(drv_data->dev, &rate_index) &&
++	    rate_index < HIDPP20_EXT_REPORT_RATE_COUNT) {
++		unsigned int rate_hz = hidpp20_ext_report_rate_index_to_hz(rate_index);
++
++		log_debug(ratbag, "report rate is %u\n", rate_hz);
++		ratbag_device_for_each_profile(device, profile)
++			profile->hz = rate_hz;
++	}
++
++	log_debug(ratbag, "device has %d report rates\n", nrates);
++
++	return 0;
++}
++
++/**
++ * Onboard profiles (0x8100) store the report rate as a whole number of
++ * milliseconds, so only rates up to 1000Hz can be stored there.
++ */
++static void
++hidpp20drv_set_report_rate_list_8100(struct ratbag_profile *profile,
++				     struct hidpp20drv_data *drv_data)
++{
++	unsigned int rates[ARRAY_LENGTH(drv_data->report_rates)];
++	unsigned int i, nrates = 0;
++
++	for (i = 0; i < drv_data->num_report_rates; i++) {
++		if (drv_data->report_rates[i] <= 1000 &&
++		    1000 % drv_data->report_rates[i] == 0)
++			rates[nrates++] = drv_data->report_rates[i];
++	}
++
++	ratbag_profile_set_report_rate_list(profile, rates, nrates);
++}
++
+ static int
+ hidpp20drv_read_resolution_dpi(struct ratbag_profile *profile)
+ {
+@@ -909,8 +972,12 @@ hidpp20drv_read_resolution_dpi(struct ratbag_profile *profile)
+ 		return 0;
+ 	}
+ 
+-	if (drv_data->capabilities & HIDPP_CAP_SWITCHABLE_RESOLUTION_2201) {
+-		rc = hidpp20drv_read_resolution_dpi_2201(device);
++	if (drv_data->capabilities & (HIDPP_CAP_SWITCHABLE_RESOLUTION_2201 |
++				      HIDPP_CAP_SWITCHABLE_RESOLUTION_2202)) {
++		rc = hidpp20drv_read_resolution_dpi_sensors(device,
++			(drv_data->capabilities & HIDPP_CAP_SWITCHABLE_RESOLUTION_2202) ?
++				HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI :
++				HIDPP_PAGE_ADJUSTABLE_DPI);
+ 		if (rc < 0)
+ 			return rc;
+ 
+@@ -940,6 +1007,14 @@ hidpp20drv_read_resolution_dpi(struct ratbag_profile *profile)
+ 		if (rc < 0 && drv_data->report_rates[0] == 0)
+ 			return rc;
+ 
++		ratbag_profile_set_report_rate_list(profile,
++						    drv_data->report_rates,
++						    drv_data->num_report_rates);
++	} else if (drv_data->capabilities & HIDPP_CAP_ADJUSTABLE_REPORT_RATE_8061) {
++		rc = hidpp20drv_read_report_rate_8061(device);
++		if (rc < 0 && drv_data->report_rates[0] == 0)
++			return rc;
++
+ 		ratbag_profile_set_report_rate_list(profile,
+ 						    drv_data->report_rates,
+ 						    drv_data->num_report_rates);
+@@ -977,7 +1052,6 @@ hidpp20drv_update_resolution_dpi(struct ratbag_resolution *resolution,
+ 	struct ratbag_device *device = profile->device;
+ 	struct hidpp20drv_data *drv_data = ratbag_get_drv_data(device);
+ 	struct hidpp20_sensor *sensor;
+-	int i;
+ 	int dpi = dpi_x; /* dpi_x == dpi_y if we don't have the individual resolution cap */
+ 
+ 	if (resolution->is_disabled) {
+@@ -990,7 +1064,8 @@ hidpp20drv_update_resolution_dpi(struct ratbag_resolution *resolution,
+ 	if (drv_data->capabilities & HIDPP_CAP_ONBOARD_PROFILES_8100)
+ 		return hidpp20drv_update_resolution_dpi_8100(resolution, dpi_x, dpi_y);
+ 
+-	if (!(drv_data->capabilities & HIDPP_CAP_SWITCHABLE_RESOLUTION_2201))
++	if (!(drv_data->capabilities & (HIDPP_CAP_SWITCHABLE_RESOLUTION_2201 |
++					HIDPP_CAP_SWITCHABLE_RESOLUTION_2202)))
+ 		return -ENOTSUP;
+ 
+ 	if (!drv_data->num_sensors)
+@@ -999,25 +1074,12 @@ hidpp20drv_update_resolution_dpi(struct ratbag_resolution *resolution,
+ 	/* just for clarity, we use the first available sensor only */
+ 	sensor = &drv_data->sensors[0];
+ 
+-	if (!resolution->is_disabled) {
+-		/* validate that the sensor accepts the given DPI */
+-		if (dpi < sensor->dpi_min || dpi > sensor->dpi_max)
+-			return -EINVAL;
+-		if (sensor->dpi_steps) {
+-			for (i = sensor->dpi_min; i < dpi; i += sensor->dpi_steps) {
+-			}
+-			if (i != dpi)
+-				return -EINVAL;
+-		} else {
+-			i = 0;
+-			while (sensor->dpi_list[i]) {
+-				if (sensor->dpi_list[i] == dpi)
+-					break;
+-			}
+-			if (sensor->dpi_list[i] != dpi)
+-				return -EINVAL;
+-		}
+-	}
++	/* validate that the sensor accepts the given DPI */
++	if (!resolution->is_disabled && !hidpp20_sensor_accepts_dpi(sensor, dpi))
++		return -EINVAL;
++
++	if (drv_data->capabilities & HIDPP_CAP_SWITCHABLE_RESOLUTION_2202)
++		return hidpp20_ext_adjustable_dpi_set_sensor_dpi(drv_data->dev, sensor, dpi);
+ 
+ 	return hidpp20_adjustable_dpi_set_sensor_dpi(drv_data->dev, sensor, dpi);
+ }
+@@ -1036,6 +1098,28 @@ hidpp20drv_update_report_rate_8060(struct ratbag_profile *profile, int hz)
+ 	return RATBAG_SUCCESS;
+ }
+ 
++static int
++hidpp20drv_update_report_rate_8061(struct ratbag_profile *profile, int hz)
++{
++	struct ratbag_device *device = profile->device;
++	struct hidpp20drv_data *drv_data = ratbag_get_drv_data(device);
++	uint8_t rate_index;
++	int rc;
++
++	for (rate_index = 0; rate_index < HIDPP20_EXT_REPORT_RATE_COUNT; rate_index++) {
++		if (hidpp20_ext_report_rate_index_to_hz(rate_index) == (unsigned int)hz)
++			break;
++	}
++	if (rate_index == HIDPP20_EXT_REPORT_RATE_COUNT)
++		return -EINVAL;
++
++	rc = hidpp20_ext_adjustable_report_rate_set_report_rate(drv_data->dev, rate_index);
++	if (rc)
++		return rc;
++
++	return RATBAG_SUCCESS;
++}
++
+ static int
+ hidpp20drv_update_report_rate_8100(struct ratbag_profile *profile, int hz)
+ {
+@@ -1069,6 +1153,16 @@ hidpp20drv_update_report_rate(struct ratbag_profile *profile, int hz)
+ 		return rc;
+ 	}
+ 
++	if (drv_data->capabilities & HIDPP_CAP_ADJUSTABLE_REPORT_RATE_8061) {
++		rc = hidpp20drv_update_report_rate_8061(profile, hz);
++
++		/* re-populate the profile with the correct value if we fail */
++		if (rc)
++			hidpp20drv_read_report_rate_8061(profile->device);
++
++		return rc;
++	}
++
+ 	return -ENOTSUP;
+ }
+ 
+@@ -1240,9 +1334,7 @@ hidpp20drv_read_profile_8100(struct ratbag_profile *profile)
+ 							  sensor->dpi_max);
+ 	}
+ 
+-	ratbag_profile_set_report_rate_list(profile,
+-					    drv_data->report_rates,
+-					    drv_data->num_report_rates);
++	hidpp20drv_set_report_rate_list_8100(profile, drv_data);
+ 	profile->hz = p->report_rate;
+ }
+ 
+@@ -1291,7 +1383,8 @@ hidpp20drv_init_profile_8100(struct ratbag_device *device)
+ 	drv_data->num_profiles = drv_data->profiles->num_profiles;
+ 	drv_data->num_buttons = drv_data->profiles->num_buttons;
+ 
+-	if (drv_data->capabilities & HIDPP_CAP_SWITCHABLE_RESOLUTION_2201)
++	if (drv_data->capabilities & (HIDPP_CAP_SWITCHABLE_RESOLUTION_2201 |
++				      HIDPP_CAP_SWITCHABLE_RESOLUTION_2202))
+ 		drv_data->num_resolutions = drv_data->profiles->num_modes;
+ 	/* We ignore the profile's num_leds and require
+ 	* HIDPP_PAGE_COLOR_LED_EFFECTS to succeed instead
+@@ -1363,12 +1456,22 @@ hidpp20drv_init_feature(struct ratbag_device *device, uint16_t feature)
+ 		log_debug(ratbag, "device has adjustable dpi\n");
+ 		/* we read the profile once to get the correct number of
+ 		 * supported resolutions. */
+-		rc = hidpp20drv_read_resolution_dpi_2201(device);
++		rc = hidpp20drv_read_resolution_dpi_sensors(device, HIDPP_PAGE_ADJUSTABLE_DPI);
+ 		if (rc < 0)
+ 			return 0; /* this is not a hard failure */
+ 		drv_data->capabilities |= HIDPP_CAP_SWITCHABLE_RESOLUTION_2201;
+ 		break;
+ 	}
++	case HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI: {
++		log_debug(ratbag, "device has extended adjustable dpi\n");
++		/* we read the profile once to get the correct number of
++		 * supported resolutions. */
++		rc = hidpp20drv_read_resolution_dpi_sensors(device, HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI);
++		if (rc < 0)
++			return 0; /* this is not a hard failure */
++		drv_data->capabilities |= HIDPP_CAP_SWITCHABLE_RESOLUTION_2202;
++		break;
++	}
+ 	case HIDPP_PAGE_SPECIAL_KEYS_BUTTONS: {
+ 		log_debug(ratbag, "device has programmable keys/buttons\n");
+ 		drv_data->capabilities |= HIDPP_CAP_BUTTON_KEY_1b04;
+@@ -1431,6 +1534,18 @@ hidpp20drv_init_feature(struct ratbag_device *device, uint16_t feature)
+ 		drv_data->capabilities |= HIDPP_CAP_ADJUSTABLE_REPORT_RATE_8060;
+ 		break;
+ 	}
++	case HIDPP_PAGE_EXTENDED_ADJUSTABLE_REPORT_RATE: {
++		log_debug(ratbag, "device has extended adjustable report rate\n");
++
++		/* we read the profile once to get the correct number of
++		 * supported report rates. */
++		rc = hidpp20drv_read_report_rate_8061(device);
++		if (rc < 0)
++			return 0; /* this is not a hard failure */
++
++		drv_data->capabilities |= HIDPP_CAP_ADJUSTABLE_REPORT_RATE_8061;
++		break;
++	}
+ 	case HIDPP_PAGE_COLOR_LED_EFFECTS: {
+ 		/* The 8070 feature implemented in the G602 doesn't follow the spec,
+ 		 * so we ignore it */
+diff --git a/src/hidpp20.c b/src/hidpp20.c
+index 24f5b56..6442bb8 100644
+--- a/src/hidpp20.c
++++ b/src/hidpp20.c
+@@ -64,7 +64,9 @@ hidpp20_feature_get_name(uint16_t feature)
+ 	CASE_RETURN_STRING(HIDPP_PAGE_WIRELESS_DEVICE_STATUS);
+ 	CASE_RETURN_STRING(HIDPP_PAGE_MOUSE_POINTER_BASIC);
+ 	CASE_RETURN_STRING(HIDPP_PAGE_ADJUSTABLE_DPI);
++	CASE_RETURN_STRING(HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI);
+ 	CASE_RETURN_STRING(HIDPP_PAGE_ADJUSTABLE_REPORT_RATE);
++	CASE_RETURN_STRING(HIDPP_PAGE_EXTENDED_ADJUSTABLE_REPORT_RATE);
+ 	CASE_RETURN_STRING(HIDPP_PAGE_COLOR_LED_EFFECTS);
+ 	CASE_RETURN_STRING(HIDPP_PAGE_RGB_EFFECTS);
+ 	CASE_RETURN_STRING(HIDPP_PAGE_ONBOARD_PROFILES);
+@@ -1687,6 +1689,357 @@ int hidpp20_adjustable_dpi_set_sensor_dpi(struct hidpp20_device *device,
+ 	return 0;
+ }
+ 
++/* -------------------------------------------------------------------------- */
++/* 0x2202: Extended Adjustable DPI                                            */
++/* -------------------------------------------------------------------------- */
++
++#define CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_COUNT		0x00
++#define CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_CAPABILITIES	0x10
++#define CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_DPI_RANGES	0x20
++#define CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_DPI_PARAMETERS	0x50
++#define CMD_EXT_ADJUSTABLE_DPI_SET_SENSOR_DPI_PARAMETERS	0x60
++
++#define HIDPP20_EXT_ADJUSTABLE_DPI_DIRECTION_X		0x00
++
++/* Each getSensorDpiRanges() reply carries 13 payload bytes after the
++ * 3 byte header (sensor index, direction, range index). */
++#define HIDPP20_EXT_ADJUSTABLE_DPI_RANGE_PAYLOAD	13
++#define HIDPP20_EXT_ADJUSTABLE_DPI_MAX_RANGE_REPLIES	16
++
++bool
++hidpp20_sensor_accepts_dpi(const struct hidpp20_sensor *sensor, uint16_t dpi)
++{
++	unsigned int i;
++
++	if (dpi < sensor->dpi_min || dpi > sensor->dpi_max)
++		return false;
++
++	if (sensor->num_dpi_ranges) {
++		for (i = 0; i < sensor->num_dpi_ranges; i++) {
++			const struct hidpp20_sensor_dpi_range *r = &sensor->dpi_ranges[i];
++
++			if (dpi < r->first || dpi > r->last)
++				continue;
++			if (r->step == 0 || (dpi - r->first) % r->step == 0)
++				return true;
++		}
++		return false;
++	}
++
++	if (sensor->dpi_steps)
++		return (dpi - sensor->dpi_min) % sensor->dpi_steps == 0;
++
++	for (i = 0; i < ARRAY_LENGTH(sensor->dpi_list) && sensor->dpi_list[i]; i++) {
++		if (sensor->dpi_list[i] == dpi)
++			return true;
++	}
++
++	return false;
++}
++
++static int
++hidpp20_ext_adjustable_dpi_get_count(struct hidpp20_device *device, uint8_t reg)
++{
++	int rc;
++	union hidpp20_message msg = {
++		.msg.report_id = REPORT_ID_SHORT,
++		.msg.device_idx = device->index,
++		.msg.sub_id = reg,
++		.msg.address = CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_COUNT,
++	};
++
++	rc = hidpp20_request_command(device, &msg);
++	if (rc)
++		return rc;
++
++	return msg.msg.parameters[0];
++}
++
++static int
++hidpp20_ext_adjustable_dpi_get_capabilities(struct hidpp20_device *device,
++					    uint8_t reg,
++					    struct hidpp20_sensor *sensor)
++{
++	int rc;
++	union hidpp20_message msg = {
++		.msg.report_id = REPORT_ID_SHORT,
++		.msg.device_idx = device->index,
++		.msg.sub_id = reg,
++		.msg.address = CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_CAPABILITIES,
++		.msg.parameters[0] = sensor->index,
++	};
++
++	rc = hidpp20_request_command(device, &msg);
++	if (rc)
++		return rc;
++
++	/* parameters[1] is the number of DPI levels, unused here */
++	sensor->ext_capabilities = msg.msg.parameters[2];
++
++	return 0;
++}
++
++static int
++hidpp20_sensor_add_dpi_range(struct hidpp20_device *device,
++			     struct hidpp20_sensor *sensor,
++			     uint16_t first, uint16_t last, uint16_t step)
++{
++	struct hidpp20_sensor_dpi_range *range;
++
++	if (sensor->num_dpi_ranges >= ARRAY_LENGTH(sensor->dpi_ranges)) {
++		hidpp_log_error(&device->base,
++				"0x2202: too many DPI ranges on sensor %d\n",
++				sensor->index);
++		return -EPROTO;
++	}
++
++	range = &sensor->dpi_ranges[sensor->num_dpi_ranges++];
++	range->first = first;
++	range->last = last;
++	range->step = step;
++
++	return 0;
++}
++
++/**
++ * The device answers getSensorDpiRanges() with a stream of big endian u16
++ * values spread over several replies, 13 payload bytes per reply. Plain
++ * values are DPIs, a value >= 0xe000 is a step size which applies from the
++ * preceding DPI up to the following one. A zero terminates the stream.
++ *
++ * Example (G502 X LIGHTSPEED): 100 step1 200 step2 500 step5 1000 ... 44000 0
++ */
++static int
++hidpp20_ext_adjustable_dpi_get_dpi_ranges(struct hidpp20_device *device,
++					  uint8_t reg,
++					  struct hidpp20_sensor *sensor)
++{
++	uint8_t stream[HIDPP20_EXT_ADJUSTABLE_DPI_MAX_RANGE_REPLIES *
++		       HIDPP20_EXT_ADJUSTABLE_DPI_RANGE_PAYLOAD];
++	size_t len = 0, pos;
++	uint8_t range_index;
++	uint16_t previous = 0, step = 0;
++	bool terminated = false;
++	bool have_previous = false, previous_covered = false;
++	int rc;
++
++	for (range_index = 0;
++	     range_index < HIDPP20_EXT_ADJUSTABLE_DPI_MAX_RANGE_REPLIES && !terminated;
++	     range_index++) {
++		union hidpp20_message msg = {
++			.msg.report_id = REPORT_ID_LONG,
++			.msg.device_idx = device->index,
++			.msg.sub_id = reg,
++			.msg.address = CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_DPI_RANGES,
++			.msg.parameters[0] = sensor->index,
++			.msg.parameters[1] = HIDPP20_EXT_ADJUSTABLE_DPI_DIRECTION_X,
++			.msg.parameters[2] = range_index,
++		};
++
++		rc = hidpp20_request_command(device, &msg);
++		if (rc)
++			return rc;
++
++		memcpy(stream + len, &msg.msg.parameters[3],
++		       HIDPP20_EXT_ADJUSTABLE_DPI_RANGE_PAYLOAD);
++		len += HIDPP20_EXT_ADJUSTABLE_DPI_RANGE_PAYLOAD;
++
++		/* a terminating zero somewhere in the stream so far? */
++		for (pos = 0; pos + 1 < len; pos += 2) {
++			if (get_unaligned_be_u16(&stream[pos]) == 0) {
++				terminated = true;
++				break;
++			}
++		}
++	}
++
++	if (!terminated) {
++		hidpp_log_error(&device->base,
++				"0x2202: DPI range list of sensor %d is not terminated\n",
++				sensor->index);
++		return -EPROTO;
++	}
++
++	sensor->dpi_min = 0xffff;
++	sensor->dpi_max = 0;
++	sensor->dpi_steps = 0;
++	sensor->num_dpi_ranges = 0;
++
++	for (pos = 0; pos + 1 < len; pos += 2) {
++		uint16_t value = get_unaligned_be_u16(&stream[pos]);
++
++		if (value == 0)
++			break;
++
++		if (value >= 0xe000) {
++			step = value - 0xe000;
++			continue;
++		}
++
++		if (step && have_previous && previous < value) {
++			/* previous ... value in steps of 'step' */
++			rc = hidpp20_sensor_add_dpi_range(device, sensor, previous, value, step);
++			if (rc)
++				return rc;
++			previous_covered = true;
++		} else {
++			/* a plain value not followed by a step is a discrete DPI */
++			if (have_previous && !previous_covered) {
++				rc = hidpp20_sensor_add_dpi_range(device, sensor, previous, previous, 0);
++				if (rc)
++					return rc;
++			}
++			previous_covered = false;
++		}
++
++		sensor->dpi_min = min(value, sensor->dpi_min);
++		sensor->dpi_max = max(value, sensor->dpi_max);
++		previous = value;
++		have_previous = true;
++		step = 0;
++	}
++
++	if (have_previous && !previous_covered) {
++		rc = hidpp20_sensor_add_dpi_range(device, sensor, previous, previous, 0);
++		if (rc)
++			return rc;
++	}
++
++	if (sensor->dpi_max == 0) {
++		hidpp_log_error(&device->base,
++				"0x2202: sensor %d reports no DPI values\n",
++				sensor->index);
++		return -EPROTO;
++	}
++
++	return 0;
++}
++
++static int
++hidpp20_ext_adjustable_dpi_get_dpi(struct hidpp20_device *device,
++				   uint8_t reg,
++				   struct hidpp20_sensor *sensor)
++{
++	int rc;
++	union hidpp20_message msg = {
++		.msg.report_id = REPORT_ID_SHORT,
++		.msg.device_idx = device->index,
++		.msg.sub_id = reg,
++		.msg.address = CMD_EXT_ADJUSTABLE_DPI_GET_SENSOR_DPI_PARAMETERS,
++		.msg.parameters[0] = sensor->index,
++	};
++
++	rc = hidpp20_request_command(device, &msg);
++	if (rc)
++		return rc;
++
++	/* [1..2] dpi X, [3..4] default dpi X, [5..6] dpi Y,
++	 * [7..8] default dpi Y, [9] lift off distance */
++	sensor->dpi = get_unaligned_be_u16(&msg.msg.parameters[1]);
++	sensor->default_dpi = get_unaligned_be_u16(&msg.msg.parameters[3]);
++	sensor->lod = msg.msg.parameters[9];
++
++	return 0;
++}
++
++int hidpp20_ext_adjustable_dpi_get_sensors(struct hidpp20_device *device,
++					   struct hidpp20_sensor **sensors_list)
++{
++	uint8_t feature_index;
++	struct hidpp20_sensor *s_list, *sensor;
++	uint8_t num_sensors;
++	unsigned i;
++	int rc;
++
++	feature_index = hidpp_root_get_feature_idx(device,
++						   HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI);
++	if (feature_index == 0)
++		return -ENOTSUP;
++
++	rc = hidpp20_ext_adjustable_dpi_get_count(device, feature_index);
++	if (rc < 0)
++		return rc;
++
++	num_sensors = rc;
++	if (num_sensors == 0) {
++		*sensors_list = NULL;
++		return 0;
++	}
++
++	s_list = zalloc(num_sensors * sizeof(struct hidpp20_sensor));
++
++	for (i = 0; i < num_sensors; i++) {
++		sensor = &s_list[i];
++		sensor->index = i;
++
++		rc = hidpp20_ext_adjustable_dpi_get_capabilities(device,
++								 feature_index,
++								 sensor);
++		if (rc)
++			goto err;
++
++		rc = hidpp20_ext_adjustable_dpi_get_dpi_ranges(device,
++							       feature_index,
++							       sensor);
++		if (rc)
++			goto err;
++
++		rc = hidpp20_ext_adjustable_dpi_get_dpi(device, feature_index, sensor);
++		if (rc)
++			goto err;
++
++		hidpp_log_raw(&device->base,
++			      "sensor %d: current dpi: %d (default: %d) min: %d max: %d ranges: %d caps: 0x%02x\n",
++			      sensor->index,
++			      sensor->dpi,
++			      sensor->default_dpi,
++			      sensor->dpi_min,
++			      sensor->dpi_max,
++			      sensor->num_dpi_ranges,
++			      sensor->ext_capabilities);
++	}
++
++	*sensors_list = s_list;
++	return num_sensors;
++err:
++	free(s_list);
++	return rc > 0 ? -EPROTO : rc;
++}
++
++int hidpp20_ext_adjustable_dpi_set_sensor_dpi(struct hidpp20_device *device,
++					      struct hidpp20_sensor *sensor,
++					      uint16_t dpi)
++{
++	uint8_t feature_index;
++	int rc;
++	union hidpp20_message msg = {
++		.msg.report_id = REPORT_ID_LONG,
++		.msg.device_idx = device->index,
++		.msg.address = CMD_EXT_ADJUSTABLE_DPI_SET_SENSOR_DPI_PARAMETERS,
++		.msg.parameters[0] = sensor->index,
++	};
++
++	feature_index = hidpp_root_get_feature_idx(device,
++						   HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI);
++	if (feature_index == 0)
++		return -ENOTSUP;
++
++	msg.msg.sub_id = feature_index;
++
++	/* [1..2] dpi X, [3..4] dpi Y, [5] lift off distance */
++	set_unaligned_be_u16(&msg.msg.parameters[1], dpi);
++	if (sensor->ext_capabilities & HIDPP20_EXT_ADJUSTABLE_DPI_CAP_Y)
++		set_unaligned_be_u16(&msg.msg.parameters[3], dpi);
++	if (sensor->ext_capabilities & HIDPP20_EXT_ADJUSTABLE_DPI_CAP_LOD)
++		msg.msg.parameters[5] = sensor->lod;
++
++	rc = hidpp20_request_command(device, &msg);
++	if (rc)
++		return rc;
++
++	return 0;
++}
++
+ /* -------------------------------------------------------------------------- */
+ /* 0x8060 - Adjustable Report Rate                                            */
+ /* -------------------------------------------------------------------------- */
+@@ -1776,6 +2129,120 @@ int hidpp20_adjustable_report_rate_set_report_rate(struct hidpp20_device *device
+ 	return 0;
+ }
+ 
++/* -------------------------------------------------------------------------- */
++/* 0x8061 - Extended Adjustable Report Rate                                   */
++/* -------------------------------------------------------------------------- */
++
++#define CMD_EXT_ADJUSTABLE_REPORT_RATE_GET_DEVICE_CAPABILITIES	0x00
++#define CMD_EXT_ADJUSTABLE_REPORT_RATE_GET_REPORT_RATE_LIST	0x10
++#define CMD_EXT_ADJUSTABLE_REPORT_RATE_GET_REPORT_RATE		0x20
++#define CMD_EXT_ADJUSTABLE_REPORT_RATE_SET_REPORT_RATE		0x30
++
++/* connection types: 0 wired, 1 LIGHTSPEED. Devices answer the same list
++ * for both, so we try them in order until one is accepted. */
++#define HIDPP20_EXT_REPORT_RATE_CONNECTION_TYPES	2
++
++static int
++hidpp20_ext_adjustable_report_rate_request(struct hidpp20_device *device,
++					   uint8_t command,
++					   union hidpp20_message *msg)
++{
++	uint8_t feature_index;
++	uint8_t connection_type;
++	int rc = -ENOTSUP;
++
++	feature_index = hidpp_root_get_feature_idx(device,
++						   HIDPP_PAGE_EXTENDED_ADJUSTABLE_REPORT_RATE);
++	if (feature_index == 0)
++		return -ENOTSUP;
++
++	for (connection_type = 0;
++	     connection_type < HIDPP20_EXT_REPORT_RATE_CONNECTION_TYPES;
++	     connection_type++) {
++		union hidpp20_message request = {
++			.msg.report_id = REPORT_ID_SHORT,
++			.msg.device_idx = device->index,
++			.msg.sub_id = feature_index,
++			.msg.address = command,
++			.msg.parameters[0] = connection_type,
++		};
++
++		rc = hidpp20_request_command_allow_error(device, &request,
++							 connection_type + 1 < HIDPP20_EXT_REPORT_RATE_CONNECTION_TYPES);
++		if (rc == 0) {
++			*msg = request;
++			return 0;
++		}
++		if (rc < 0)
++			return rc;
++	}
++
++	return rc > 0 ? -EPROTO : rc;
++}
++
++int hidpp20_ext_adjustable_report_rate_get_report_rate_list(struct hidpp20_device *device,
++							    uint16_t *bitflags)
++{
++	union hidpp20_message msg;
++	int rc;
++
++	rc = hidpp20_ext_adjustable_report_rate_request(device,
++							CMD_EXT_ADJUSTABLE_REPORT_RATE_GET_REPORT_RATE_LIST,
++							&msg);
++	if (rc)
++		return rc;
++
++	*bitflags = get_unaligned_be_u16(&msg.msg.parameters[0]);
++
++	return 0;
++}
++
++int hidpp20_ext_adjustable_report_rate_get_report_rate(struct hidpp20_device *device,
++						       uint8_t *rate_index)
++{
++	union hidpp20_message msg;
++	int rc;
++
++	rc = hidpp20_ext_adjustable_report_rate_request(device,
++							CMD_EXT_ADJUSTABLE_REPORT_RATE_GET_REPORT_RATE,
++							&msg);
++	if (rc)
++		return rc;
++
++	*rate_index = msg.msg.parameters[0];
++
++	return 0;
++}
++
++int hidpp20_ext_adjustable_report_rate_set_report_rate(struct hidpp20_device *device,
++						       uint8_t rate_index)
++{
++	uint8_t feature_index;
++	int rc;
++	union hidpp20_message msg = {
++		.msg.report_id = REPORT_ID_SHORT,
++		.msg.device_idx = device->index,
++		.msg.address = CMD_EXT_ADJUSTABLE_REPORT_RATE_SET_REPORT_RATE,
++		.msg.parameters[0] = rate_index,
++	};
++
++	if (rate_index >= HIDPP20_EXT_REPORT_RATE_COUNT)
++		return -EINVAL;
++
++	feature_index = hidpp_root_get_feature_idx(device,
++						   HIDPP_PAGE_EXTENDED_ADJUSTABLE_REPORT_RATE);
++	if (feature_index == 0)
++		return -ENOTSUP;
++
++	msg.msg.sub_id = feature_index;
++
++	rc = hidpp20_request_command(device, &msg);
++	if (rc)
++		return rc;
++
++	return 0;
++}
++
+ /* -------------------------------------------------------------------------- */
+ /* 0x8100 - Onboard Profiles                                                  */
+ /* -------------------------------------------------------------------------- */
+@@ -1805,6 +2272,7 @@ int hidpp20_adjustable_report_rate_set_report_rate(struct hidpp20_device *device
+ #define HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G900	0x03
+ #define HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G915	0x04
+ #define HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G502X	0x05
++#define HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G502X_LS	0x0a
+ #define HIDPP20_ONBOARD_PROFILES_MACRO_TYPE_G402	0x01
+ 
+ #define HIDPP20_USER_PROFILES_G402			0x0000
+@@ -2225,7 +2693,8 @@ hidpp20_onboard_profiles_validate(struct hidpp20_device *device,
+ 	    (info->profile_format_id != HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G303) &&
+ 	    (info->profile_format_id != HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G900) &&
+ 	    (info->profile_format_id != HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G915) &&
+-	    (info->profile_format_id != HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G502X)) {
++	    (info->profile_format_id != HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G502X) &&
++	    (info->profile_format_id != HIDPP20_ONBOARD_PROFILES_PROFILE_TYPE_G502X_LS)) {
+ 		hidpp_log_error(&device->base,
+ 				"Profile layout not supported: 0x%02x.\n",
+ 				info->profile_format_id);
+@@ -2867,6 +3336,12 @@ read_profiles:
+ 		else
+ 			profiles->profiles[i].address = HIDPP20_ROM_PROFILES_G402 + i + 1;
+ 
++		/* Without a valid profile directory (e.g. a device that was
++		   never written to) the firmware runs on its ROM profiles, so
++		   expose those as the enabled ones. */
++		if (!read_userdata)
++			profiles->profiles[i].enabled = i < profiles->num_rom_profiles;
++
+ 		rc = hidpp20_onboard_profiles_parse_profile(device,
+ 							profiles,
+ 							i,
+diff --git a/src/hidpp20.h b/src/hidpp20.h
+index 86f528b..235f82a 100644
+--- a/src/hidpp20.h
++++ b/src/hidpp20.h
+@@ -406,8 +406,26 @@ struct hidpp20_sensor {
+ 	uint16_t dpi_steps;
+ 	uint16_t default_dpi;
+ 	uint16_t dpi_list[LONG_MESSAGE_LENGTH / 2 + 1];
++
++	/* 0x2202 only: the supported DPIs as ranges with a step size each.
++	 * When num_dpi_ranges is non-zero use hidpp20_sensor_accepts_dpi()
++	 * instead of dpi_steps/dpi_list. */
++	struct hidpp20_sensor_dpi_range {
++		uint16_t first;
++		uint16_t last;
++		uint16_t step;
++	} dpi_ranges[16];
++	unsigned int num_dpi_ranges;
++	uint8_t ext_capabilities;
++	uint8_t lod;
+ };
+ 
++/**
++ * Returns true if the sensor can be set to the given dpi value.
++ */
++bool hidpp20_sensor_accepts_dpi(const struct hidpp20_sensor *sensor,
++				uint16_t dpi);
++
+ /**
+  * allocates a list of sensors that has to be freed by the caller.
+  *
+@@ -423,6 +441,35 @@ int hidpp20_adjustable_dpi_get_sensors(struct hidpp20_device *device,
+ int hidpp20_adjustable_dpi_set_sensor_dpi(struct hidpp20_device *device,
+ 					  struct hidpp20_sensor *sensor, uint16_t dpi);
+ 
++/* -------------------------------------------------------------------------- */
++/* 0x2202: Extended Adjustable DPI                                            */
++/* -------------------------------------------------------------------------- */
++
++#define HIDPP_PAGE_EXTENDED_ADJUSTABLE_DPI		0x2202
++
++#define HIDPP20_EXT_ADJUSTABLE_DPI_CAP_Y		(1 << 0)
++#define HIDPP20_EXT_ADJUSTABLE_DPI_CAP_LOD		(1 << 1)
++
++/**
++ * Same as hidpp20_adjustable_dpi_get_sensors() for devices with the
++ * 0x2202 feature (e.g. G502 X LIGHTSPEED). Only the X direction is used,
++ * the Y direction is always set to the same value.
++ *
++ * allocates a list of sensors that has to be freed by the caller.
++ *
++ * returns the elements in the list or a negative error
++ */
++int hidpp20_ext_adjustable_dpi_get_sensors(struct hidpp20_device *device,
++					   struct hidpp20_sensor **sensors_list);
++
++/**
++ * set the current dpi of the provided sensor. sensor must have been
++ * allocated by hidpp20_ext_adjustable_dpi_get_sensors()
++ */
++int hidpp20_ext_adjustable_dpi_set_sensor_dpi(struct hidpp20_device *device,
++					      struct hidpp20_sensor *sensor,
++					      uint16_t dpi);
++
+ /* -------------------------------------------------------------------------- */
+ /* 0x8060 - Adjustable Report Rate                                            */
+ /* -------------------------------------------------------------------------- */
+@@ -442,6 +489,35 @@ int hidpp20_adjustable_report_rate_get_report_rate(struct hidpp20_device *device
+ int hidpp20_adjustable_report_rate_set_report_rate(struct hidpp20_device *device,
+ 						   uint8_t rate_ms);
+ 
++/* -------------------------------------------------------------------------- */
++/* 0x8061 - Extended Adjustable Report Rate                                   */
++/* -------------------------------------------------------------------------- */
++
++#define HIDPP_PAGE_EXTENDED_ADJUSTABLE_REPORT_RATE	0x8061
++
++/* 0x8061 uses rate indices: index n means (125 << n) Hz, i.e. 125, 250,
++ * 500, 1000, 2000, 4000 and 8000 Hz. */
++#define HIDPP20_EXT_REPORT_RATE_COUNT			7
++
++static inline unsigned int
++hidpp20_ext_report_rate_index_to_hz(uint8_t index)
++{
++	return 125u << index;
++}
++
++/**
++ * set bitflags to the supported report rates, bit n set means that the
++ * rate with index n is supported.
++ */
++int hidpp20_ext_adjustable_report_rate_get_report_rate_list(struct hidpp20_device *device,
++							    uint16_t *bitflags);
++
++int hidpp20_ext_adjustable_report_rate_get_report_rate(struct hidpp20_device *device,
++						       uint8_t *rate_index);
++
++int hidpp20_ext_adjustable_report_rate_set_report_rate(struct hidpp20_device *device,
++						       uint8_t rate_index);
++
+ /* -------------------------------------------------------------------------- */
+ /* 0x8070v4 - Color LED effects                                               */
+ /* -------------------------------------------------------------------------- */
+@@ -1014,7 +1090,15 @@ hidpp20_onboard_profiles_write_sector(struct hidpp20_device *device,
+ static inline uint8_t *
+ hidpp20_onboard_profiles_allocate_sector(struct hidpp20_profiles *profiles)
+ {
+-	return zalloc(profiles->sector_size);
++	/* Some devices (e.g. the G502 X LIGHTSPEED) report 255-byte sectors,
++	 * but the buffer is also accessed through the 256-byte
++	 * hidpp20_internal_profile union. Never allocate less than that. */
++	size_t size = profiles->sector_size;
++
++	if (size < 256)
++		size = 256;
++
++	return zalloc(size);
+ }
+ 
+ void
+-- 
+2.56.0
+

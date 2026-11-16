@@ -1,0 +1,345 @@
+From 8398a6784dcb0f50c547b2329a13115a2053f446 Mon Sep 17 00:00:00 2001
+From: DanielBeeck <daniel.beck99@outlook.de>
+Date: Fri, 13 Nov 2026 16:41:51 +0100
+Subject: [PATCH 4/6] Add a factory reset for onboard profiles
+
+ratbag_device_factory_reset() asks the driver to restore the profiles the
+device shipped with and re-read them; the hidpp20 driver implements it by
+loading the ROM profiles into the user slots and writing them back with a
+regular commit, so only the well tested write path is used. ratbagd
+exposes it as Device.FactoryReset() -> u and emits Resync afterwards.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ doc/dbus.rst             |  9 ++++++
+ ratbagd/ratbagd-device.c | 25 +++++++++++++++
+ src/driver-hidpp20.c     | 24 +++++++++++++++
+ src/hidpp20.c            | 42 +++++++++++++++++++++++++
+ src/hidpp20.h            | 12 ++++++++
+ src/libratbag-private.h  |  6 ++++
+ src/libratbag.c          | 66 +++++++++++++++++++++++++++++-----------
+ src/libratbag.h          | 17 +++++++++++
+ 8 files changed, 184 insertions(+), 17 deletions(-)
+
+diff --git a/doc/dbus.rst b/doc/dbus.rst
+index 97ba66d..711925a 100644
+--- a/doc/dbus.rst
++++ b/doc/dbus.rst
+@@ -185,6 +185,15 @@ known to ratbagd.
+         occurs, the :func:`Resync` signal is emitted and all properties are
+         updated to the current state.
+ 
++.. function:: FactoryReset() → (u)
++
++        Restores the onboard profiles of the device to the factory defaults
++        and discards all pending changes. Unlike :func:`Commit()` this call
++        is synchronous and may take a few seconds; the return value is the
++        libratbag error code (0 on success, or the capability error when the
++        device does not support a reset). The :func:`Resync` signal is
++        emitted afterwards and all properties are updated to the new state.
++
+ .. function:: Resync()
+ 
+         :type: Signal
+diff --git a/ratbagd/ratbagd-device.c b/ratbagd/ratbagd-device.c
+index 8d14f0a..cc957d4 100644
+--- a/ratbagd/ratbagd-device.c
++++ b/ratbagd/ratbagd-device.c
+@@ -206,6 +206,30 @@ static void ratbagd_device_commit_pending(void *data)
+ 	ratbagd_device_unref(device);
+ }
+ 
++static int ratbagd_device_factory_reset(sd_bus_message *m,
++					void *userdata,
++					sd_bus_error *error)
++{
++	struct ratbagd_device *device = userdata;
++	int r;
++
++	/* Unlike Commit this runs synchronously so the caller learns whether
++	 * the device accepted the reset. Clients must use a generous timeout. */
++	r = ratbag_device_factory_reset(device->lib_device);
++	if (r)
++		log_error("error restoring the factory profiles (%d)\n", r);
++
++	/* the profiles changed completely, make every client re-read them */
++	ratbagd_device_resync(device, device->ctx->bus);
++	ratbagd_for_each_profile_signal(device->ctx->bus,
++					device,
++					ratbagd_profile_notify_dirty);
++
++	CHECK_CALL(sd_bus_reply_method_return(m, "u", r));
++
++	return 0;
++}
++
+ static int ratbagd_device_commit(sd_bus_message *m,
+ 				 void *userdata,
+ 				 sd_bus_error *error)
+@@ -271,6 +295,7 @@ const sd_bus_vtable ratbagd_device_vtable[] = {
+ 	SD_BUS_PROPERTY("FirmwareVersion", "s", ratbagd_device_get_firmware_version, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+ 	SD_BUS_PROPERTY("Profiles", "ao", ratbagd_device_get_profiles, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+ 	SD_BUS_METHOD("Commit", "", "u", ratbagd_device_commit, SD_BUS_VTABLE_UNPRIVILEGED),
++	SD_BUS_METHOD("FactoryReset", "", "u", ratbagd_device_factory_reset, SD_BUS_VTABLE_UNPRIVILEGED),
+ 	SD_BUS_SIGNAL("Resync", "", 0),
+ 	SD_BUS_VTABLE_END,
+ };
+diff --git a/src/driver-hidpp20.c b/src/driver-hidpp20.c
+index b1677da..1db57e2 100644
+--- a/src/driver-hidpp20.c
++++ b/src/driver-hidpp20.c
+@@ -1668,6 +1668,29 @@ hidpp20drv_commit(struct ratbag_device *device)
+ 	return RATBAG_SUCCESS;
+ }
+ 
++static int
++hidpp20drv_factory_reset(struct ratbag_device *device)
++{
++	struct hidpp20drv_data *drv_data = ratbag_get_drv_data(device);
++	struct ratbag_profile *profile;
++	int rc;
++
++	if (!(drv_data->capabilities & HIDPP_CAP_ONBOARD_PROFILES_8100))
++		return -ENOTSUP;
++
++	rc = hidpp20_onboard_profiles_factory_reset(drv_data->dev, drv_data->profiles);
++	if (rc < 0) {
++		log_error(device->ratbag,
++			  "hidpp20: failed to restore the factory profiles (%d)\n", rc);
++		return rc;
++	}
++
++	ratbag_device_for_each_profile(device, profile)
++		hidpp20drv_read_profile(profile);
++
++	return 0;
++}
++
+ static int
+ hidpp20drv_20_probe(struct ratbag_device *device)
+ {
+@@ -1857,5 +1880,6 @@ struct ratbag_driver hidpp20_driver = {
+ 	.probe = hidpp20drv_probe,
+ 	.remove = hidpp20drv_remove,
+ 	.commit = hidpp20drv_commit,
++	.factory_reset = hidpp20drv_factory_reset,
+ 	.set_active_profile = hidpp20drv_set_current_profile,
+ };
+diff --git a/src/hidpp20.c b/src/hidpp20.c
+index 6442bb8..834e72c 100644
+--- a/src/hidpp20.c
++++ b/src/hidpp20.c
+@@ -3501,6 +3501,48 @@ hidpp20_onboard_profiles_commit(struct hidpp20_device *device,
+ 	return hidpp20_onboard_profiles_write_dict(device, profiles_list);
+ }
+ 
++int
++hidpp20_onboard_profiles_factory_reset(struct hidpp20_device *device,
++				       struct hidpp20_profiles *profiles_list)
++{
++	struct hidpp20_profile *profile;
++	unsigned int i;
++	int rc;
++
++	/* Load the ROM profiles into the user slots, the same way a device
++	 * without a valid profile directory is read. */
++	for (i = 0; i < profiles_list->num_profiles; i++) {
++		profile = &profiles_list->profiles[i];
++
++		if (i + 1 > profiles_list->num_rom_profiles)
++			profile->address = HIDPP20_ROM_PROFILES_G402 + 1;
++		else
++			profile->address = HIDPP20_ROM_PROFILES_G402 + i + 1;
++		profile->enabled = i < profiles_list->num_rom_profiles;
++
++		rc = hidpp20_onboard_profiles_parse_profile(device, profiles_list, i, false);
++		if (rc < 0) {
++			hidpp_log_error(&device->base,
++					"failed to read ROM profile %u (%d)\n", i, rc);
++			return rc;
++		}
++	}
++
++	/* Write them back as regular user profiles with a valid directory,
++	 * exactly like a normal commit does. */
++	rc = hidpp20_onboard_profiles_commit(device, profiles_list);
++	if (rc < 0)
++		return rc;
++
++	rc = hidpp20_onboard_profiles_set_current_profile(device, 0);
++	if (rc < 0)
++		return rc;
++	profiles_list->active_profile_index = 0;
++
++	/* and pick up what the device actually stored */
++	return hidpp20_onboard_profiles_initialize(device, profiles_list);
++}
++
+ static const enum ratbag_button_action_special hidpp20_profiles_specials[] = {
+ 	[0x00] = RATBAG_BUTTON_ACTION_SPECIAL_INVALID,
+ 	[0x01] = RATBAG_BUTTON_ACTION_SPECIAL_WHEEL_LEFT,
+diff --git a/src/hidpp20.h b/src/hidpp20.h
+index 235f82a..b48c7fb 100644
+--- a/src/hidpp20.h
++++ b/src/hidpp20.h
+@@ -1068,6 +1068,18 @@ int
+ hidpp20_onboard_profiles_commit(struct hidpp20_device *device,
+ 				struct hidpp20_profiles *profiles_list);
+ 
++/**
++ * Restore the factory profiles: every user profile is replaced by the
++ * ROM profile the device shipped with, only as many profiles as the device
++ * has ROM profiles are enabled and the first profile is made the current
++ * one. The profile list is re-read from the device afterwards.
++ *
++ * return 0 or a negative error.
++ */
++int
++hidpp20_onboard_profiles_factory_reset(struct hidpp20_device *device,
++				       struct hidpp20_profiles *profiles_list);
++
+ enum ratbag_button_action_special
+ hidpp20_onboard_profiles_get_special(uint8_t code);
+ 
+diff --git a/src/libratbag-private.h b/src/libratbag-private.h
+index 9d91e0a..50a2e4f 100644
+--- a/src/libratbag-private.h
++++ b/src/libratbag-private.h
+@@ -198,6 +198,12 @@ struct ratbag_driver {
+ 	 */
+ 	int (*commit)(struct ratbag_device *device);
+ 
++	/**
++	 * Restore the device's onboard profiles to the factory defaults and
++	 * re-read the profiles. Optional.
++	 */
++	int (*factory_reset)(struct ratbag_device *device);
++
+ 	/**
+ 	 * Called to mark a previously written profile as active.
+ 	 *
+diff --git a/src/libratbag.c b/src/libratbag.c
+index 2248f2f..1418611 100644
+--- a/src/libratbag.c
++++ b/src/libratbag.c
+@@ -843,40 +843,72 @@ ratbag_device_get_num_leds(const struct ratbag_device *device)
+ 	return device->num_leds;
+ }
+ 
+-LIBRATBAG_EXPORT enum ratbag_error_code
+-ratbag_device_commit(struct ratbag_device *device)
++static void
++ratbag_profile_clear_dirty(struct ratbag_profile *profile)
+ {
+-	struct ratbag_profile *profile;
+ 	struct ratbag_button *button;
+ 	struct ratbag_led *led;
+ 	struct ratbag_resolution *resolution;
++
++	profile->dirty = false;
++
++	profile->angle_snapping_dirty = false;
++	profile->debounce_dirty = false;
++	profile->rate_dirty = false;
++
++	list_for_each(button, &profile->buttons, link)
++		button->dirty = false;
++
++	list_for_each(led, &profile->leds, link)
++		led->dirty = false;
++
++	list_for_each(resolution, &profile->resolutions, link)
++		resolution->dirty = false;
++}
++
++LIBRATBAG_EXPORT enum ratbag_error_code
++ratbag_device_factory_reset(struct ratbag_device *device)
++{
++	struct ratbag_profile *profile;
+ 	int rc;
+ 
+-	if (device->driver->commit == NULL) {
+-		log_error(device->ratbag,
+-			  "Trying to commit with a driver that doesn't support committing\n");
++	if (device->driver->factory_reset == NULL) {
++		log_debug(device->ratbag,
++			  "%s: the driver does not support a factory reset\n",
++			  device->name);
+ 		return RATBAG_ERROR_CAPABILITY;
+ 	}
+ 
+-	rc = device->driver->commit(device);
++	rc = device->driver->factory_reset(device);
+ 	if (rc)
+ 		return RATBAG_ERROR_DEVICE;
+ 
+ 	list_for_each(profile, &device->profiles, link) {
+-		profile->dirty = false;
++		ratbag_profile_clear_dirty(profile);
++		profile->is_active_dirty = false;
++	}
+ 
+-		profile->angle_snapping_dirty = false;
+-		profile->debounce_dirty = false;
+-		profile->rate_dirty = false;
++	return RATBAG_SUCCESS;
++}
++
++LIBRATBAG_EXPORT enum ratbag_error_code
++ratbag_device_commit(struct ratbag_device *device)
++{
++	struct ratbag_profile *profile;
++	int rc;
+ 
+-		list_for_each(button, &profile->buttons, link)
+-			button->dirty = false;
++	if (device->driver->commit == NULL) {
++		log_error(device->ratbag,
++			  "Trying to commit with a driver that doesn't support committing\n");
++		return RATBAG_ERROR_CAPABILITY;
++	}
+ 
+-		list_for_each(led, &profile->leds, link)
+-			led->dirty = false;
++	rc = device->driver->commit(device);
++	if (rc)
++		return RATBAG_ERROR_DEVICE;
+ 
+-		list_for_each(resolution, &profile->resolutions, link)
+-			resolution->dirty = false;
++	list_for_each(profile, &device->profiles, link) {
++		ratbag_profile_clear_dirty(profile);
+ 
+ 		/* TODO: think if this should be moved into `driver-commit`. */
+ 		if (profile->is_active_dirty && profile->is_active) {
+diff --git a/src/libratbag.h b/src/libratbag.h
+index 2119a2a..27e8208 100644
+--- a/src/libratbag.h
++++ b/src/libratbag.h
+@@ -512,6 +512,23 @@ ratbag_device_get_product_version(const struct ratbag_device *device);
+ enum ratbag_error_code
+ ratbag_device_commit(struct ratbag_device *device);
+ 
++/**
++ * @ingroup device
++ *
++ * Restore the onboard profiles of the device to the factory defaults, i.e.
++ * the profiles the device shipped with, and discard all pending changes.
++ * Depending on the device, this may take a couple of seconds. All profile,
++ * resolution, button and LED objects of the device must be re-read
++ * afterwards.
++ *
++ * @param device A previously initialized ratbag device
++ * @return 0 on success or an error code otherwise
++ * @retval RATBAG_ERROR_CAPABILITY The device does not support a factory
++ * reset
++ */
++enum ratbag_error_code
++ratbag_device_factory_reset(struct ratbag_device *device);
++
+ /**
+  * @ingroup device
+  *
+-- 
+2.56.0
+

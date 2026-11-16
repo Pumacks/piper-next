@@ -1,0 +1,699 @@
+From b11f22a4a09ce84acae82edb0424333c82301c5a Mon Sep 17 00:00:00 2001
+From: DanielBeeck <daniel.beck99@outlook.de>
+Date: Fri, 13 Nov 2026 21:17:36 +0100
+Subject: [PATCH 5/6] hidpp20: store real macros in the onboard macro memory
+
+Until now the hidpp20 driver only accepted macros that boil down to one
+key with modifiers and turned them into a keyboard binding; anything
+else was silently lost. Serialize other macros into the device's macro
+memory instead: every profile gets the sector right after the profile
+sectors, the button bindings point at (sector, offset) and the sector is
+written with a CRC on commit.
+
+The reader assumed macro commands never cross a 16 byte boundary and
+jumped to the next sector when they did, which made macros written by
+Logitech's own software fail with 'error while parsing macro'. Parse a
+sector contiguously instead, follow JUMP commands explicitly and know the
+size of every command including the one byte flow control commands.
+
+Expose the device-side flow control as new macro events: wait for
+release, repeat while pressed and repeat until cancelled (a toggle). The
+hidpp20 driver reads and writes them, the other macro capable drivers
+reject them with an error, and ratbagd passes them through unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ratbagd/ratbagd-button.c      |   5 +
+ src/driver-gskill.c           |   6 +
+ src/driver-hidpp20.c          | 147 +++++++++++++++++++-
+ src/driver-roccat-kone-emp.c  |   6 +
+ src/driver-roccat-kone-pure.c |   6 +
+ src/driver-roccat.c           |   6 +
+ src/driver-sinowealth.c       |   5 +
+ src/hidpp20.c                 | 245 +++++++++++++++++++++++++++-------
+ src/hidpp20.h                 |   4 +
+ src/libratbag-enums.h         |  11 ++
+ src/libratbag.c               |   3 +
+ 11 files changed, 387 insertions(+), 57 deletions(-)
+
+diff --git a/ratbagd/ratbagd-button.c b/ratbagd/ratbagd-button.c
+index a200fa7..ebefd9b 100644
+--- a/ratbagd/ratbagd-button.c
++++ b/ratbagd/ratbagd-button.c
+@@ -239,6 +239,11 @@ static int ratbagd_button_get_macro(sd_bus *bus,
+ 		case RATBAG_MACRO_EVENT_WAIT:
+ 			value = ratbag_button_macro_get_event_timeout(macro, idx);
+ 			break;
++		case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++		case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++		case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
++			value = 0;
++			break;
+ 		default:
+ 			abort();
+ 		}
+diff --git a/src/driver-gskill.c b/src/driver-gskill.c
+index a1236f7..a9e5e51 100644
+--- a/src/driver-gskill.c
++++ b/src/driver-gskill.c
+@@ -851,6 +851,12 @@ gskill_macro_to_report(struct ratbag_device *device,
+ 			buf[profile_pos] = gskill_macro_code_from_event(device,
+ 									event);
+ 			break;
++		case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++		case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++		case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
++			log_error(device->ratbag,
++				  "macro flow control is not supported by this device.\n");
++			goto out;
+ 		case RATBAG_MACRO_EVENT_INVALID:
+ 		case RATBAG_MACRO_EVENT_NONE:
+ 			goto out;
+diff --git a/src/driver-hidpp20.c b/src/driver-hidpp20.c
+index 1db57e2..2731346 100644
+--- a/src/driver-hidpp20.c
++++ b/src/driver-hidpp20.c
+@@ -133,6 +133,119 @@ hidpp20drv_read_macro_key_8100(struct ratbag_device *device, union hidpp20_macro
+ 	return ratbag_hidraw_get_keycode_from_keyboard_usage(device, macro->key.key);
+ }
+ 
++static uint8_t
++hidpp20drv_macro_modifier_mask_8100(unsigned int keycode)
++{
++	switch (keycode) {
++	case KEY_LEFTCTRL: return 0x01;
++	case KEY_LEFTSHIFT: return 0x02;
++	case KEY_LEFTALT: return 0x04;
++	case KEY_LEFTMETA: return 0x08;
++	case KEY_RIGHTCTRL: return 0x10;
++	case KEY_RIGHTSHIFT: return 0x20;
++	case KEY_RIGHTALT: return 0x40;
++	case KEY_RIGHTMETA: return 0x80;
++	}
++
++	return 0;
++}
++
++/**
++ * Convert the button's ratbag macro into onboard macro commands. The
++ * commands are stored in the profile and written to the device's macro
++ * memory on commit.
++ */
++static int
++hidpp20drv_write_macro_8100(struct ratbag_button *button,
++			    struct hidpp20_profile *profile)
++{
++	struct ratbag_device *device = button->profile->device;
++	const struct ratbag_macro *macro = button->action.macro;
++	union hidpp20_macro_data *items;
++	unsigned int i, n = 0;
++
++	if (!macro)
++		return -EINVAL;
++
++	/* one command per event plus the terminating END */
++	items = zalloc((MAX_MACRO_EVENTS + 1) * sizeof(*items));
++
++	for (i = 0; i < MAX_MACRO_EVENTS; i++) {
++		const struct ratbag_macro_event *event = &macro->events[i];
++		union hidpp20_macro_data *item = &items[n];
++		bool press;
++		uint8_t modifier, usage;
++		uint16_t consumer;
++
++		if (event->type == RATBAG_MACRO_EVENT_NONE)
++			break;
++
++		switch (event->type) {
++		case RATBAG_MACRO_EVENT_KEY_PRESSED:
++		case RATBAG_MACRO_EVENT_KEY_RELEASED:
++			press = event->type == RATBAG_MACRO_EVENT_KEY_PRESSED;
++			modifier = hidpp20drv_macro_modifier_mask_8100(event->event.key);
++			if (modifier) {
++				item->key.type = press ? HIDPP20_MACRO_KEY_PRESS : HIDPP20_MACRO_KEY_RELEASE;
++				item->key.modifier = modifier;
++				break;
++			}
++			usage = ratbag_hidraw_get_keyboard_usage_from_keycode(device, event->event.key);
++			if (usage) {
++				item->key.type = press ? HIDPP20_MACRO_KEY_PRESS : HIDPP20_MACRO_KEY_RELEASE;
++				item->key.key = usage;
++				break;
++			}
++			consumer = ratbag_hidraw_get_consumer_usage_from_keycode(device, event->event.key);
++			if (!consumer) {
++				log_error(device->ratbag,
++					  "hidpp20: key %u cannot be stored in a macro\n",
++					  event->event.key);
++				goto err;
++			}
++			item->consumer.type = press ? HIDPP20_MACRO_CONS_DOWN : HIDPP20_MACRO_CONS_UP;
++			item->consumer.usage = hidpp_cpu_to_be_u16(consumer);
++			break;
++		case RATBAG_MACRO_EVENT_WAIT:
++			item->delay.type = HIDPP20_MACRO_DELAY;
++			item->delay.time = min(event->event.timeout, 0xffffu);
++			break;
++		case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++			item->any.type = HIDPP20_MACRO_WAIT_FOR_RELEASE;
++			break;
++		case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++			item->any.type = HIDPP20_MACRO_REPEAT_WHILE_PRESSED;
++			break;
++		case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
++			item->any.type = HIDPP20_MACRO_REPEAT_UNTIL_CANCELED;
++			break;
++		default:
++			goto err;
++		}
++		n++;
++	}
++
++	if (n == 0)
++		goto err;
++
++	items[n].any.type = HIDPP20_MACRO_END;
++
++	free(profile->macros[button->index]);
++	profile->macros[button->index] = items;
++
++	/* the sector and offset are assigned when the macros are written */
++	profile->buttons[button->index].macro.type = HIDPP20_BUTTON_MACRO;
++	profile->buttons[button->index].macro.page = button->index;
++	profile->buttons[button->index].macro.zero = 0;
++	profile->buttons[button->index].macro.offset = 0;
++
++	return 0;
++
++err:
++	free(items);
++	return -EINVAL;
++}
++
+ static int
+ hidpp20drv_read_macro_8100(struct ratbag_button *button,
+ 			   struct hidpp20_profile *profile,
+@@ -188,6 +301,21 @@ hidpp20drv_read_macro_8100(struct ratbag_button *button,
+ 						      keycode);
+ 			delay = false;
+ 			break;
++		case HIDPP20_MACRO_WAIT_FOR_RELEASE:
++			ratbag_button_macro_set_event(m, i++,
++						      RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE, 0);
++			delay = true;
++			break;
++		case HIDPP20_MACRO_REPEAT_WHILE_PRESSED:
++			ratbag_button_macro_set_event(m, i++,
++						      RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED, 0);
++			delay = true;
++			break;
++		case HIDPP20_MACRO_REPEAT_UNTIL_CANCELED:
++			ratbag_button_macro_set_event(m, i++,
++						      RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED, 0);
++			delay = true;
++			break;
+ 		}
+ 		macro++;
+ 	}
+@@ -548,17 +676,24 @@ hidpp20drv_update_button_8100(struct ratbag_button *button)
+ 		profile->buttons[button->index].button.buttons = action->action.button;
+ 		break;
+ 	case RATBAG_BUTTON_ACTION_TYPE_MACRO:
+-		type = HIDPP20_BUTTON_HID_TYPE;
+-		subtype = HIDPP20_BUTTON_HID_TYPE_KEYBOARD;
+ 		rc = ratbag_action_keycode_from_macro(action,
+ 						      &key,
+ 						      &modifiers);
+-		if (rc < 0) {
+-			log_error(device->ratbag,
+-				  "Error while writing macro for button %d\n",
+-				  button->index);
++		if (rc != 1) {
++			/* not a plain key with modifiers: store it in the
++			 * onboard macro memory */
++			rc = hidpp20drv_write_macro_8100(button, profile);
++			if (rc < 0) {
++				log_error(device->ratbag,
++					  "Error while writing macro for button %d (%d)\n",
++					  button->index, rc);
++				return rc;
++			}
++			break;
+ 		}
+ 
++		type = HIDPP20_BUTTON_HID_TYPE;
++		subtype = HIDPP20_BUTTON_HID_TYPE_KEYBOARD;
+ 		code = ratbag_hidraw_get_keyboard_usage_from_keycode(device, key);
+ 		if (code == 0) {
+ 			subtype = HIDPP20_BUTTON_HID_TYPE_CONSUMER_CONTROL;
+diff --git a/src/driver-roccat-kone-emp.c b/src/driver-roccat-kone-emp.c
+index c0461da..7302176 100644
+--- a/src/driver-roccat-kone-emp.c
++++ b/src/driver-roccat-kone-emp.c
+@@ -643,6 +643,12 @@ roccat_write_profile(struct ratbag_profile *profile)
+ 				case RATBAG_MACRO_EVENT_WAIT:
+ 					macro->keys[--count].time = button->action.macro->events[i].event.timeout;
+ 					break;
++				case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++				case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++				case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
++					log_error(device->ratbag,
++						"macro flow control is not supported by this device.\n");
++					continue;
+ 				case RATBAG_MACRO_EVENT_INVALID:
+ 				case RATBAG_MACRO_EVENT_NONE:
+ 					/* should not happen */
+diff --git a/src/driver-roccat-kone-pure.c b/src/driver-roccat-kone-pure.c
+index 9c629c6..6c2f414 100644
+--- a/src/driver-roccat-kone-pure.c
++++ b/src/driver-roccat-kone-pure.c
+@@ -524,6 +524,12 @@ roccat_write_macro(struct ratbag_button *button,
+ 		case RATBAG_MACRO_EVENT_WAIT:
+ 			macro->keys[--count].time = action->macro->events[i].event.timeout;
+ 			break;
++		case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++		case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++		case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
++			log_error(device->ratbag,
++				  "macro flow control is not supported by this device.\n");
++			continue;
+ 		case RATBAG_MACRO_EVENT_INVALID:
+ 		case RATBAG_MACRO_EVENT_NONE:
+ 			/* should not happen */
+diff --git a/src/driver-roccat.c b/src/driver-roccat.c
+index 48783c2..d8ac2d7 100644
+--- a/src/driver-roccat.c
++++ b/src/driver-roccat.c
+@@ -523,6 +523,12 @@ roccat_write_macro(struct ratbag_button *button,
+ 		case RATBAG_MACRO_EVENT_WAIT:
+ 			macro->keys[--count].time = action->macro->events[i].event.timeout;
+ 			break;
++		case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++		case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++		case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
++			log_error(device->ratbag,
++				  "macro flow control is not supported by this device.\n");
++			continue;
+ 		case RATBAG_MACRO_EVENT_INVALID:
+ 		case RATBAG_MACRO_EVENT_NONE:
+ 			/* should not happen */
+diff --git a/src/driver-sinowealth.c b/src/driver-sinowealth.c
+index 997acd0..e939db9 100644
+--- a/src/driver-sinowealth.c
++++ b/src/driver-sinowealth.c
+@@ -1659,6 +1659,11 @@ sinowealth_update_macro_events_from_action(
+ 			prev_mouse_macro_event->delay = (uint8_t)*timeout;
+ 			break;
+ 		}
++		case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++		case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++		case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
++			log_error(device->ratbag, "Macro for button %u: flow control is not supported by this device\n", button->index);
++			return -EINVAL;
+ 		case RATBAG_MACRO_EVENT_NONE:
+ 			/* Handled separately above. */
+ 			break;
+diff --git a/src/hidpp20.c b/src/hidpp20.c
+index 834e72c..b0f9d20 100644
+--- a/src/hidpp20.c
++++ b/src/hidpp20.c
+@@ -2276,6 +2276,10 @@ int hidpp20_ext_adjustable_report_rate_set_report_rate(struct hidpp20_device *de
+ #define HIDPP20_ONBOARD_PROFILES_MACRO_TYPE_G402	0x01
+ 
+ #define HIDPP20_USER_PROFILES_G402			0x0000
++
++/* sanity limits while parsing or writing macros */
++#define HIDPP20_MACRO_MAX_JUMPS				64
++#define HIDPP20_MACRO_MAX_ITEMS				1024
+ #define HIDPP20_ROM_PROFILES_G402			0x0100
+ 
+ #define HIDPP20_PROFILE_DIR_END				0xFFFF
+@@ -2781,51 +2785,68 @@ hidpp20_onboard_profiles_allocate(struct hidpp20_device *device,
+ 	return 0;
+ }
+ 
++/**
++ * Size in bytes of a macro command in the device memory, or -EINVAL for
++ * commands libratbag does not know how to parse.
++ */
++static int
++hidpp20_macro_item_size(uint8_t type)
++{
++	switch (type) {
++	case HIDPP20_MACRO_NOOP:
++	case HIDPP20_MACRO_WAIT_FOR_RELEASE:
++	case HIDPP20_MACRO_REPEAT_WHILE_PRESSED:
++	case HIDPP20_MACRO_REPEAT_UNTIL_CANCELED:
++	case HIDPP20_MACRO_END:
++		return 1;
++	case HIDPP20_MACRO_DELAY:
++	case HIDPP20_MACRO_KEY_PRESS:
++	case HIDPP20_MACRO_KEY_RELEASE:
++	case HIDPP20_MACRO_BUTTON_DOWN:
++	case HIDPP20_MACRO_BUTTON_UP:
++	case HIDPP20_MACRO_CONS_DOWN:
++	case HIDPP20_MACRO_CONS_UP:
++	case HIDPP20_MACRO_JUMP:
++		return 3;
++	default:
++		return -EINVAL;
++	}
++}
++
++/**
++ * Read the next macro command from a sector image. Returns -EAGAIN when
++ * more commands follow, 0 on the END command and -EFAULT on bad data.
++ */
+ static int
+ hidpp20_onboard_profiles_macro_next(struct hidpp20_device *device,
+-				    uint8_t memory[32],
++				    const uint8_t *memory,
++				    uint16_t memory_size,
+ 				    uint16_t *index,
+ 				    union hidpp20_macro_data *macro)
+ {
+-	int rc = 0;
+-	unsigned int step = 1;
++	int size;
+ 
+-	if (*index >= 32 - sizeof(union hidpp20_macro_data)) {
++	if (*index >= memory_size) {
+ 		hidpp_log_error(&device->base, "error while parsing macro.\n");
+ 		return -EFAULT;
+ 	}
+ 
+-	memcpy(macro, &memory[*index], sizeof(union hidpp20_macro_data));
+-
+-	switch (macro->any.type) {
+-	case HIDPP20_MACRO_DELAY:
+-		/* fallthrough */
+-	case HIDPP20_MACRO_KEY_PRESS:
+-		/* fallthrough */
+-	case HIDPP20_MACRO_KEY_RELEASE:
+-		/* fallthrough */
+-	case HIDPP20_MACRO_JUMP:
+-		step = 3;
+-		rc = -EAGAIN;
+-		break;
+-	case HIDPP20_MACRO_NOOP:
+-		step = 1;
+-		rc = -EAGAIN;
+-		break;
+-	case HIDPP20_MACRO_END:
+-		return 0;
+-	default:
+-		hidpp_log_error(&device->base, "unknown tag: 0x%02x\n", macro->any.type);
+-		rc = -EFAULT;
++	size = hidpp20_macro_item_size(memory[*index]);
++	if (size < 0) {
++		hidpp_log_error(&device->base, "unknown tag: 0x%02x\n", memory[*index]);
++		return -EFAULT;
+ 	}
+ 
+-	if ((*index + step) & 0xF0)
+-		/* the next item will be on the following chunk */
+-		return -ENOMEM;
++	if (*index + size > memory_size) {
++		hidpp_log_error(&device->base, "error while parsing macro.\n");
++		return -EFAULT;
++	}
+ 
+-	*index += step;
++	memset(macro, 0, sizeof(*macro));
++	memcpy(macro, &memory[*index], size);
++	*index += size;
+ 
+-	return rc;
++	return macro->any.type == HIDPP20_MACRO_END ? 0 : -EAGAIN;
+ }
+ 
+ static int
+@@ -2838,11 +2859,19 @@ hidpp20_onboard_profiles_read_macro(struct hidpp20_device *device,
+ 	union hidpp20_macro_data *macro = NULL;
+ 	unsigned count = 0;
+ 	unsigned index = 0;
++	unsigned jumps = 0;
+ 	uint16_t mem_index = offset;
+-	int rc = -ENOMEM;
++	int rc;
+ 
+ 	memory = hidpp20_onboard_profiles_allocate_sector(profiles);
+ 
++	rc = hidpp20_onboard_profiles_read_sector(device,
++						  page,
++						  profiles->sector_size,
++						  memory);
++	if (rc)
++		goto out_err;
++
+ 	do {
+ 		if (count == index) {
+ 			union hidpp20_macro_data *tmp;
+@@ -2857,32 +2886,32 @@ hidpp20_onboard_profiles_read_macro(struct hidpp20_device *device,
+ 			macro = tmp;
+ 		}
+ 
+-		if (rc == -ENOMEM) {
+-			rc = hidpp20_onboard_profiles_read_sector(device,
+-								  page,
+-								  profiles->sector_size,
+-								  memory);
+-			if (rc)
+-				goto out_err;
+-		}
+-
+ 		rc = hidpp20_onboard_profiles_macro_next(device,
+ 							 memory,
++							 profiles->sector_size,
+ 							 &mem_index,
+ 							 &macro[index]);
+ 		if (rc == -EFAULT)
+ 			goto out_err;
+-		if (rc == -ENOMEM) {
+-			mem_index = 0;
+-			page++;
+-		} else if (macro[index].any.type == HIDPP20_MACRO_JUMP) {
++
++		if (macro[index].any.type == HIDPP20_MACRO_JUMP) {
++			/* continue at the given position, the jump itself is
++			 * not part of the macro */
++			if (++jumps > HIDPP20_MACRO_MAX_JUMPS) {
++				hidpp_log_error(&device->base, "macro jumps too often.\n");
++				rc = -EFAULT;
++				goto out_err;
++			}
+ 			page = macro[index].jump.page;
+-			offset = macro[index].jump.offset;
+-			mem_index = offset;
+-			/* no need to store the jump in memory */
+-			index--;
+-			/* force memory fetching */
+-			rc = -ENOMEM;
++			mem_index = macro[index].jump.offset;
++			memset(&macro[index], 0, sizeof(macro[index]));
++			rc = hidpp20_onboard_profiles_read_sector(device,
++								  page,
++								  profiles->sector_size,
++								  memory);
++			if (rc)
++				goto out_err;
++			rc = -EAGAIN;
+ 		} else {
+ 			index++;
+ 		}
+@@ -2929,6 +2958,13 @@ hidpp20_onboard_profiles_parse_macro(struct hidpp20_device *device,
+ 		case HIDPP20_MACRO_END:
+ 			break;
+ 		case HIDPP20_MACRO_NOOP:
++		case HIDPP20_MACRO_WAIT_FOR_RELEASE:
++		case HIDPP20_MACRO_REPEAT_WHILE_PRESSED:
++		case HIDPP20_MACRO_REPEAT_UNTIL_CANCELED:
++		case HIDPP20_MACRO_BUTTON_DOWN:
++		case HIDPP20_MACRO_BUTTON_UP:
++		case HIDPP20_MACRO_CONS_DOWN:
++		case HIDPP20_MACRO_CONS_UP:
+ 			break;
+ 		default:
+ 			hidpp_log_error(&device->base, "unknown tag: 0x%02x\n", m->any.type);
+@@ -3464,6 +3500,102 @@ hidpp20_onboard_profiles_write_profile(struct hidpp20_device *device,
+ 	return 0;
+ }
+ 
++/**
++ * Serialize the macros of a profile into that profile's macro sector and
++ * point the button bindings at them. Profile N uses sector
++ * num_profiles + N (the sectors right after the profile sectors), so every
++ * profile has one sector of macro memory.
++ */
++static int
++hidpp20_onboard_profiles_write_macros(struct hidpp20_device *device,
++				      struct hidpp20_profiles *profiles_list,
++				      unsigned int profile_index)
++{
++	struct hidpp20_profile *profile = &profiles_list->profiles[profile_index];
++	_cleanup_free_ uint8_t *data = NULL;
++	uint16_t sector_size = profiles_list->sector_size;
++	uint16_t sector, offset = 0;
++	unsigned int i;
++	bool have_macros = false;
++	int rc;
++
++	for (i = 0; i < profiles_list->num_buttons; i++) {
++		if (profile->buttons[i].any.type == HIDPP20_BUTTON_MACRO &&
++		    profile->macros[i])
++			have_macros = true;
++	}
++	if (!have_macros)
++		return 0;
++
++	sector = profiles_list->num_profiles + 1 + profile_index;
++	if (sector >= profiles_list->sector_count) {
++		hidpp_log_error(&device->base,
++				"no free sector for the macros of profile %u\n",
++				profile_index + 1);
++		return -ENOSPC;
++	}
++
++	data = hidpp20_onboard_profiles_allocate_sector(profiles_list);
++	memset(data, 0xff, sector_size);
++
++	for (i = 0; i < profiles_list->num_buttons; i++) {
++		union hidpp20_macro_data *item;
++		uint16_t start = offset;
++		unsigned int n;
++
++		if (profile->buttons[i].any.type != HIDPP20_BUTTON_MACRO ||
++		    !profile->macros[i])
++			continue;
++
++		for (n = 0, item = profile->macros[i]; ; n++, item++) {
++			union hidpp20_macro_data out = *item;
++			int size = hidpp20_macro_item_size(item->any.type);
++
++			if (n >= HIDPP20_MACRO_MAX_ITEMS) {
++				hidpp_log_error(&device->base,
++						"macro of button %u is not terminated\n", i);
++				return -EINVAL;
++			}
++			if (size < 0 || item->any.type == HIDPP20_MACRO_JUMP) {
++				hidpp_log_error(&device->base,
++						"cannot write macro command 0x%02x\n",
++						item->any.type);
++				return -EINVAL;
++			}
++			/* keep the last two bytes for the CRC */
++			if (offset + size > sector_size - 2) {
++				hidpp_log_error(&device->base,
++						"the macros of profile %u do not fit into one sector\n",
++						profile_index + 1);
++				return -ENOSPC;
++			}
++			if (item->any.type == HIDPP20_MACRO_DELAY)
++				out.delay.time = hidpp_cpu_to_be_u16(item->delay.time);
++
++			memcpy(&data[offset], &out, size);
++			offset += size;
++
++			if (item->any.type == HIDPP20_MACRO_END)
++				break;
++		}
++
++		/* the binding stores the sector in the 'zero' field until
++		 * hidpp20_buttons_from_cpu() swaps it into place */
++		profile->buttons[i].macro.zero = sector;
++		profile->buttons[i].macro.offset = start;
++	}
++
++	hidpp_log_debug(&device->base,
++			"writing %u bytes of macros for profile %u to sector 0x%04x\n",
++			offset, profile_index + 1, sector);
++
++	rc = hidpp20_onboard_profiles_write_sector(device, sector, sector_size, data, true);
++	if (rc < 0)
++		hidpp_log_error(&device->base, "failed to write macros\n");
++
++	return rc;
++}
++
+ int
+ hidpp20_onboard_profiles_commit(struct hidpp20_device *device,
+ 				struct hidpp20_profiles *profiles_list)
+@@ -3477,6 +3609,12 @@ hidpp20_onboard_profiles_commit(struct hidpp20_device *device,
+ 		profile = &profiles_list->profiles[i];
+ 
+ 		if (profile->enabled) {
++			rc = hidpp20_onboard_profiles_write_macros(device,
++								   profiles_list,
++								   i);
++			if (rc < 0)
++				return rc;
++
+ 			rc = hidpp20_onboard_profiles_write_profile(device,
+ 								    profiles_list,
+ 								    i);
+@@ -3490,6 +3628,11 @@ hidpp20_onboard_profiles_commit(struct hidpp20_device *device,
+ 	if (!enabled_profile) {
+ 		if (profiles_list->num_profiles > 0) {
+ 			profiles_list->profiles[0].enabled = 1;
++			rc = hidpp20_onboard_profiles_write_macros(device,
++								   profiles_list,
++								   0);
++			if (rc < 0)
++				return rc;
+ 			rc = hidpp20_onboard_profiles_write_profile(device,
+ 			                                            profiles_list,
+ 			                                            0);
+diff --git a/src/hidpp20.h b/src/hidpp20.h
+index b48c7fb..2c6bb64 100644
+--- a/src/hidpp20.h
++++ b/src/hidpp20.h
+@@ -944,6 +944,10 @@ union hidpp20_macro_data {
+ 		uint8_t offset;
+ 		uint8_t page;
+ 	} __attribute__((packed)) jump;
++	struct {
++		uint8_t type; /* HIDPP20_MACRO_CONS_DOWN or HIDPP20_MACRO_CONS_UP */
++		uint16_t usage; /* big endian, as on the device */
++	} __attribute__((packed)) consumer;
+ 	struct {
+ 		uint8_t type; /* HIDPP20_MACRO_END */
+ 	} __attribute__((packed)) end;
+diff --git a/src/libratbag-enums.h b/src/libratbag-enums.h
+index 6fd8a92..645e67e 100644
+--- a/src/libratbag-enums.h
++++ b/src/libratbag-enums.h
+@@ -277,6 +277,17 @@ enum ratbag_macro_event_type {
+ 	RATBAG_MACRO_EVENT_KEY_PRESSED,
+ 	RATBAG_MACRO_EVENT_KEY_RELEASED,
+ 	RATBAG_MACRO_EVENT_WAIT,
++	/**
++	 * Flow control executed by the device itself. These events carry no
++	 * data. Not every device supports them; the driver rejects the macro
++	 * if it cannot store them.
++	 */
++	/** Pause the macro until the button is released */
++	RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE,
++	/** Restart the macro from the beginning while the button is held */
++	RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED,
++	/** Restart the macro from the beginning until the button is pressed again */
++	RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED,
+ };
+ 
+ /**
+diff --git a/src/libratbag.c b/src/libratbag.c
+index 1418611..715a98c 100644
+--- a/src/libratbag.c
++++ b/src/libratbag.c
+@@ -1804,6 +1804,9 @@ ratbag_button_macro_set_event(struct ratbag_button_macro *m,
+ 		macro->events[index].type = type;
+ 		macro->events[index].event.timeout = data;
+ 		break;
++	case RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE:
++	case RATBAG_MACRO_EVENT_REPEAT_WHILE_PRESSED:
++	case RATBAG_MACRO_EVENT_REPEAT_UNTIL_CANCELED:
+ 	case RATBAG_MACRO_EVENT_NONE:
+ 		macro->events[index].type = type;
+ 		break;
+-- 
+2.56.0
+

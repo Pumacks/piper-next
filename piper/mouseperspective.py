@@ -15,7 +15,7 @@ from .virtualprofilerow import VirtualProfileRow
 from .virtualprofiles import (
     VirtualProfileError,
     VirtualProfileStore,
-    apply_snapshot,
+    apply_virtual_profile,
 )
 
 import gi
@@ -51,6 +51,10 @@ class MousePerspective(Gtk.Overlay):
             Path(GLib.get_user_config_dir()) / "piper" / "virtual_profiles.json"
         )
         self._virtual_profiles = VirtualProfileStore(config_path)
+        try:
+            self._virtual_profiles.migrate_g502_profiles()
+        except VirtualProfileError:
+            pass
 
     @GObject.Property
     def name(self) -> str:
@@ -246,7 +250,9 @@ class MousePerspective(Gtk.Overlay):
             virtual_name = row.virtual_profile["name"]
             if not isinstance(virtual_name, str) or not virtual_name.strip():
                 raise VirtualProfileError("This virtual profile has an invalid name")
-            apply_snapshot(row.virtual_profile["settings"], self._profile)
+            apply_virtual_profile(
+                row.virtual_profile, self._device.model, self._profile
+            )
         except (KeyError, TypeError, ValueError, VirtualProfileError) as error:
             self._show_virtual_profile_error(str(error))
             return

@@ -8,12 +8,15 @@ first while individual configuration pages are ported incrementally.
 """
 
 import re
+import shlex
+import shutil
 from gettext import gettext as _
 from pathlib import Path
 from typing import Optional
 
 import cairo
 import gi
+from evdev import ecodes
 
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
@@ -30,8 +33,10 @@ from .ratbagd import (
     RatbagdLed,
     RatbagdMacro,
     RatbagError,
+    RatbagCapabilityError,
     RatbagdProfile,
     RatbagdUnavailableError,
+    N_,
     evcode_to_str,
 )
 from .profilenames import ProfileNameStore
@@ -39,7 +44,7 @@ from .svg import get_svg
 from .virtualprofiles import (
     VirtualProfileError,
     VirtualProfileStore,
-    apply_snapshot,
+    apply_virtual_profile,
 )
 
 
@@ -111,9 +116,17 @@ class ButtonCaptureDialog(Adw.Window):
     _XORG_KEYCODE_OFFSET = 8
     _MAX_MACRO_EVENTS = 128
 
-    def __init__(self, parent, capture_macro: bool, on_saved, on_cancelled) -> None:
+    def __init__(
+        self,
+        parent,
+        capture_macro: bool,
+        on_saved,
+        on_cancelled,
+        toggle_hold: bool = False,
+    ) -> None:
         super().__init__(transient_for=parent, modal=True)
         self._capture_macro = capture_macro
+        self._toggle_hold = toggle_hold
         self._on_saved = on_saved
         self._on_cancelled = on_cancelled
         self._saved = False
@@ -122,7 +135,12 @@ class ButtonCaptureDialog(Adw.Window):
         self._pressed_keys = set()
         self._last_event_time: Optional[int] = None
 
-        title = _("Record a macro") if capture_macro else _("Assign a keyboard key")
+        if toggle_hold:
+            title = _("Hold a key until pressed again")
+        elif capture_macro:
+            title = _("Record a macro")
+        else:
+            title = _("Assign a keyboard key")
         self.set_title(title)
         self.set_default_size(520, 340)
 
@@ -143,14 +161,19 @@ class ButtonCaptureDialog(Adw.Window):
         content.set_margin_bottom(30)
         content.set_margin_start(30)
         content.set_margin_end(30)
-        instruction = Gtk.Label(
-            label=(
-                _("Type the key sequence, then click Use assignment.")
-                if capture_macro
-                else _("Press the keyboard key you want to assign.")
-            ),
-            wrap=True,
-        )
+        if toggle_hold:
+            instruction_text = _(
+                "Press the keyboard key, or click the box below with the "
+                "mouse button, that the macro key should hold."
+            )
+        elif capture_macro:
+            instruction_text = _(
+                "Type the key sequence (mouse clicks on the box below are "
+                "recorded too), then click Use assignment."
+            )
+        else:
+            instruction_text = _("Press the keyboard key you want to assign.")
+        instruction = Gtk.Label(label=instruction_text, wrap=True)
         instruction.add_css_class("title-3")
         content.append(instruction)
 
@@ -158,7 +181,8 @@ class ButtonCaptureDialog(Adw.Window):
         self._preview = Gtk.Label(
             label=_("Waiting for keyboard input…"),
             wrap=True,
-            selectable=True,
+            # a selectable label would open its own menu on right click
+            selectable=not (capture_macro or toggle_hold),
             margin_top=24,
             margin_bottom=24,
             margin_start=18,
@@ -166,6 +190,13 @@ class ButtonCaptureDialog(Adw.Window):
         )
         preview_frame.set_child(self._preview)
         content.append(preview_frame)
+        if capture_macro or toggle_hold:
+            clicks = Gtk.GestureClick()
+            clicks.set_button(0)
+            clicks.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            clicks.connect("pressed", self._on_mouse_pressed)
+            clicks.connect("released", self._on_mouse_released)
+            preview_frame.add_controller(clicks)
 
         clear = Gtk.Button(label=_("Clear recording"), halign=Gtk.Align.CENTER)
         clear.connect("clicked", self._on_clear_clicked)
@@ -207,6 +238,38 @@ class ButtonCaptureDialog(Adw.Window):
         self._update_preview()
         return True
 
+    # GDK button numbers to evdev button codes, as used in ratbag macros.
+    _GDK_BUTTONS = {
+        1: ecodes.BTN_LEFT,
+        2: ecodes.BTN_MIDDLE,
+        3: ecodes.BTN_RIGHT,
+        8: ecodes.BTN_SIDE,
+        9: ecodes.BTN_EXTRA,
+    }
+
+    def _on_mouse_pressed(self, gesture, _n_press, _x, _y) -> None:
+        button = self._GDK_BUTTONS.get(gesture.get_current_button())
+        if button is None:
+            self._preview.set_label(_("That mouse button cannot be stored by this device."))
+            return
+        if button in self._pressed_keys:
+            return
+        self._pressed_keys.add(button)
+        if self._capture_macro:
+            self._append_macro_event(RatbagdButton.Macro.KEY_PRESS, button)
+        else:
+            self._key = button
+        self._update_preview()
+
+    def _on_mouse_released(self, gesture, _n_press, _x, _y) -> None:
+        button = self._GDK_BUTTONS.get(gesture.get_current_button())
+        if button is None:
+            return
+        self._pressed_keys.discard(button)
+        if self._capture_macro:
+            self._append_macro_event(RatbagdButton.Macro.KEY_RELEASE, button)
+            self._update_preview()
+
     def _on_key_released(self, _controller, _keyval, keycode, _state) -> None:
         key = self._evdev_keycode(keycode)
         if key is None:
@@ -237,8 +300,14 @@ class ButtonCaptureDialog(Adw.Window):
                 text = str(RatbagdMacro.from_ratbag(self._events))
             self._save_button.set_sensitive(bool(self._events))
         else:
-            if self._key is None:
+            if self._key is None and self._toggle_hold:
+                text = _("Waiting for a keyboard key or mouse click…")
+            elif self._key is None:
                 text = _("Waiting for keyboard input…")
+            elif self._toggle_hold:
+                text = _("Press once: hold {key}. Press again: release it.").format(
+                    key=evcode_to_str(self._key)
+                )
             else:
                 macro = RatbagdMacro()
                 macro.append(RatbagdButton.Macro.KEY_PRESS, self._key)
@@ -280,6 +349,7 @@ class BetterUiApplication(Adw.Application):
 
     _CAPTURE_KEY = object()
     _CAPTURE_MACRO = object()
+    _CAPTURE_TOGGLE_HOLD = object()
 
     def __init__(self, ratbagd_api_version: int) -> None:
         super().__init__(
@@ -292,9 +362,15 @@ class BetterUiApplication(Adw.Application):
         self._toast_overlay: Optional[Adw.ToastOverlay] = None
         self._apply_button: Optional[Gtk.Button] = None
         self._profile_button: Optional[Gtk.MenuButton] = None
+        self._device_dropdown: Optional[Gtk.DropDown] = None
+        self._device_options = []
+        self._updating_device_dropdown = False
+        self._device_drafts = {}
         self._selected_device: Optional[RatbagdDevice] = None
         self._selected_profile: Optional[RatbagdProfile] = None
         self._profile_signal_device: Optional[RatbagdDevice] = None
+        self._resync_signal_handler: Optional[int] = None
+        self._pending_factory_reset: Optional[RatbagdDevice] = None
         self._profile_signal_handler: Optional[int] = None
         self._battery_device: Optional[RatbagdDevice] = None
         self._battery_proxy: Optional[Gio.DBusProxy] = None
@@ -308,6 +384,12 @@ class BetterUiApplication(Adw.Application):
         self._virtual_profiles = VirtualProfileStore(
             Path(GLib.get_user_config_dir()) / "piper" / "virtual_profiles.json"
         )
+        try:
+            # Make profiles saved from the older G502 models available to the
+            # G502 X as well; a broken library is reported when it is opened.
+            self._virtual_profiles.migrate_g502_profiles()
+        except VirtualProfileError:
+            pass
         self._profile_names = ProfileNameStore()
         self._content_page = Adw.NavigationPage.new(
             self._status_page(
@@ -336,6 +418,11 @@ class BetterUiApplication(Adw.Application):
         toolbar_view = Adw.ToolbarView()
         header_bar = Adw.HeaderBar()
         header_bar.set_title_widget(Adw.WindowTitle(title="Piper Next"))
+        self._device_dropdown = Gtk.DropDown()
+        self._device_dropdown.set_visible(False)
+        self._device_dropdown.set_tooltip_text(_("Choose a mouse to configure"))
+        self._device_dropdown.connect("notify::selected", self._on_device_selected)
+        header_bar.pack_start(self._device_dropdown)
         self._profile_button = Gtk.MenuButton()
         self._profile_button.set_visible(False)
         self._profile_button.set_tooltip_text(_("Switch profile"))
@@ -376,8 +463,13 @@ class BetterUiApplication(Adw.Application):
 
     def _refresh_devices(self) -> None:
         if self._ratbag is None or not self._ratbag.devices:
+            self._selected_device = None
+            self._selected_profile = None
+            self._device_drafts.clear()
+            self._refresh_device_dropdown()
             self._watch_active_profile(None)
             self._watch_battery(None)
+            self._set_apply_sensitive(False)
             if self._profile_button is not None:
                 self._profile_button.set_visible(False)
             self._content_page.set_child(
@@ -391,10 +483,67 @@ class BetterUiApplication(Adw.Application):
         device = self._selected_device
         if device not in self._ratbag.devices:
             device = self._ratbag.devices[0]
+        self._device_drafts = {
+            saved_id: state
+            for saved_id, state in self._device_drafts.items()
+            if any(state[0] is current for current in self._ratbag.devices)
+        }
+        self._select_device(device)
+        self._refresh_device_dropdown()
+
+    def _refresh_device_dropdown(self) -> None:
+        if self._device_dropdown is None:
+            return
+        self._device_options = list(self._ratbag.devices) if self._ratbag else []
+        labels = [f"{device.name} ({device.model})" for device in self._device_options]
+        for index, label in enumerate(labels):
+            if labels.count(label) > 1:
+                labels[index] = f"{label} — {self._device_options[index].id}"
+        self._updating_device_dropdown = True
+        try:
+            self._device_dropdown.set_model(Gtk.StringList.new(labels))
+            if self._selected_device in self._device_options:
+                self._device_dropdown.set_selected(
+                    self._device_options.index(self._selected_device)
+                )
+            self._device_dropdown.set_visible(len(self._device_options) > 1)
+        finally:
+            self._updating_device_dropdown = False
+
+    def _on_device_selected(self, dropdown, _pspec) -> None:
+        if self._updating_device_dropdown:
+            return
+        index = dropdown.get_selected()
+        if index < len(self._device_options):
+            self._select_device(self._device_options[index])
+
+    def _select_device(self, device: RatbagdDevice) -> None:
+        previous = self._selected_device
+        if (
+            previous is not None
+            and previous is not device
+            and self._ratbag is not None
+            and previous in self._ratbag.devices
+        ):
+            self._device_drafts[id(previous)] = (
+                previous,
+                self._selected_profile,
+                self._draft,
+                self._apply_button.get_sensitive() if self._apply_button else False,
+            )
         self._selected_device = device
         self._watch_active_profile(device)
-        self._selected_profile = self._current_profile(device)
-        self._draft = self._make_draft(self._selected_profile)
+        if previous is not device or self._selected_profile not in device.profiles:
+            saved = self._device_drafts.get(id(device))
+            if saved is not None and saved[0] is device and saved[1] in device.profiles:
+                self._selected_profile, self._draft, pending = saved[1:]
+            else:
+                self._selected_profile = self._current_profile(device)
+                self._draft = self._make_draft(self._selected_profile)
+                pending = False
+            self._set_apply_sensitive(
+                pending or any(profile.dirty for profile in device.profiles)
+            )
         self._show_device(device)
 
     @staticmethod
@@ -405,17 +554,31 @@ class BetterUiApplication(Adw.Application):
     def _watch_active_profile(self, device: Optional[RatbagdDevice]) -> None:
         if device is self._profile_signal_device:
             return
-        if (
-            self._profile_signal_device is not None
-            and self._profile_signal_handler is not None
-        ):
-            self._profile_signal_device.disconnect(self._profile_signal_handler)
+        if self._profile_signal_device is not None:
+            if self._resync_signal_handler is not None:
+                self._profile_signal_device.disconnect(self._resync_signal_handler)
+            if self._profile_signal_handler is not None:
+                self._profile_signal_device.disconnect(self._profile_signal_handler)
         self._profile_signal_device = device
         self._profile_signal_handler = None
+        self._resync_signal_handler = None
         if device is not None:
+            self._resync_signal_handler = device.connect(
+                "resync", self._on_device_resync
+            )
             self._profile_signal_handler = device.connect(
                 "active-profile-changed", self._on_active_profile_changed
             )
+
+    def _on_device_resync(self, device) -> None:
+        """ratbagd re-read the device: drop local drafts and show its state."""
+        self._device_drafts.pop(id(device), None)
+        if device is not self._selected_device:
+            return
+        self._selected_profile = None
+        self._select_device(device)
+        if self._pending_factory_reset is not device:
+            self._add_toast(_("Settings were reloaded from the mouse"))
 
     def _on_active_profile_changed(self, device, profile) -> None:
         if device is not self._selected_device:
@@ -479,6 +642,7 @@ class BetterUiApplication(Adw.Application):
         advanced = self._advanced_group()
         if advanced is not None:
             preferences.add(advanced)
+        preferences.add(self._onboard_memory_group(device))
         page.set_end_child(preferences)
         page.set_resize_end_child(True)
         page.set_shrink_end_child(False)
@@ -789,6 +953,16 @@ class BetterUiApplication(Adw.Application):
                 margin_end=4,
             )
             choice_content.append(Gtk.Label(label=name, xalign=0, hexpand=True))
+            copy = Gtk.Button.new_from_icon_name("edit-copy-symbolic")
+            copy.add_css_class("flat")
+            copy.set_tooltip_text(_("Copy Steam launch option"))
+            copy.connect(
+                "clicked",
+                self._on_copy_launch_option_clicked,
+                device,
+                virtual_profile,
+            )
+            choice_content.append(copy)
             delete = Gtk.Button.new_from_icon_name("user-trash-symbolic")
             delete.add_css_class("flat")
             delete.set_tooltip_text(_("Delete virtual profile"))
@@ -817,6 +991,67 @@ class BetterUiApplication(Adw.Application):
         button.set_popover(popover)
         return button
 
+    _DESKTOP_PROFILE_NAMES = ("desktop", "default")
+
+    @staticmethod
+    def _steam_launch_option(
+        device,
+        virtual_profile: dict,
+        virtual_profiles: list,
+        multiple_devices: bool,
+        executable: str = "piper-profile",
+    ) -> str:
+        """Build the Steam launch option that loads ``virtual_profile`` for a
+        game and switches back to the desktop profile when the game exits."""
+        parts = [shlex.quote(executable)]
+        if multiple_devices:
+            parts += ["--device", shlex.quote(device.model)]
+        parts += ["--profile", shlex.quote(virtual_profile["name"]), "--virtual"]
+        restore = None
+        for candidate in virtual_profiles:
+            candidate_name = candidate.get("name")
+            if (
+                isinstance(candidate_name, str)
+                and candidate_name.casefold()
+                in BetterUiApplication._DESKTOP_PROFILE_NAMES
+                and candidate is not virtual_profile
+            ):
+                restore = candidate_name
+                break
+        if restore is not None:
+            parts += ["--restore", shlex.quote(restore)]
+        parts += ["--", "%command%"]
+        return " ".join(parts)
+
+    @staticmethod
+    def _piper_profile_executable() -> str:
+        found = shutil.which("piper-profile")
+        if found:
+            return found
+        local = Path.home() / ".local" / "bin" / "piper-profile"
+        if local.exists():
+            return str(local)
+        return "piper-profile"
+
+    def _on_copy_launch_option_clicked(self, _button, device, virtual_profile) -> None:
+        try:
+            virtual_profiles = self._virtual_profiles.list_for_model(device.model)
+        except VirtualProfileError:
+            virtual_profiles = []
+        text = self._steam_launch_option(
+            device,
+            virtual_profile,
+            virtual_profiles,
+            multiple_devices=bool(self._ratbag and len(self._ratbag.devices) > 1),
+            executable=self._piper_profile_executable(),
+        )
+        display = Gdk.Display.get_default()
+        if display is None:
+            self._add_toast(_("No display to copy to"))
+            return
+        display.get_clipboard().set(text)
+        self._add_toast(_("Steam launch option copied"))
+
     @staticmethod
     def _center_paned_on_first_frame(paned, _frame_clock) -> bool:
         width = paned.get_width()
@@ -836,7 +1071,12 @@ class BetterUiApplication(Adw.Application):
         for button in self._selected_profile.buttons:
             actions = self._button_actions(button)
             if actions:
-                row = Adw.ComboRow(title=self._button_title(button.index))
+                row = Adw.ComboRow(
+                    title=self._button_title(
+                        button.index,
+                        self._selected_device.model if self._selected_device else None,
+                    )
+                )
                 row.set_model(Gtk.StringList.new([action[2] for action in actions]))
                 row.set_selected(self._selected_button_action(button, actions))
                 row.connect(
@@ -866,11 +1106,53 @@ class BetterUiApplication(Adw.Application):
         return group
 
     @staticmethod
-    def _button_title(index: int) -> str:
+    def _button_title(index: int, model: Optional[str] = None) -> str:
+        family = BetterUiApplication._button_family(model)
+        if family is not None:
+            description = family.get(index)
+            if description is not None:
+                return _(description)
+            return _("Button {}").format(index + 1)
         description = RatbagdButton.BUTTON_DESCRIPTION.get(index)
         if description is not None:
             return _(description)
         return _("Button {}").format(index + 1)
+
+    # Button order of the Logitech G502 family as reported by the firmware
+    # (verified against the G502 X LIGHTSPEED factory profile: index 4 is the
+    # thumb "sniper" DPI shift, 6/7 are the wheel tilts, 9/10 the DPI pair).
+    _G502_BUTTON_NAMES = {
+        0: N_("Left button"),
+        1: N_("Right button"),
+        2: N_("Wheel click"),
+        3: N_("Thumb back button (G4)"),
+        4: N_("Thumb sniper button (G6, DPI shift)"),
+        5: N_("Thumb forward button (G5)"),
+        6: N_("Wheel tilt left"),
+        7: N_("Wheel tilt right"),
+        8: N_("Top button behind the wheel (G9)"),
+        9: N_("DPI up button (G8)"),
+        10: N_("DPI down button (G7)"),
+    }
+    _BUTTON_FAMILIES = {
+        # G502 X, G502 X LIGHTSPEED, G502 X PLUS, G502 HERO
+        "usb:046d:c099": _G502_BUTTON_NAMES,
+        "usb:046d:c098": _G502_BUTTON_NAMES,
+        "usb:046d:409f": _G502_BUTTON_NAMES,
+        "usb:046d:c095": _G502_BUTTON_NAMES,
+        "usb:046d:4099": _G502_BUTTON_NAMES,
+        "usb:046d:c08b": _G502_BUTTON_NAMES,
+        "usb:046d:c08d": _G502_BUTTON_NAMES,
+        "usb:046d:407f": _G502_BUTTON_NAMES,
+    }
+
+    @staticmethod
+    def _button_family(model: Optional[str]) -> Optional[dict]:
+        if not model:
+            return None
+        return BetterUiApplication._BUTTON_FAMILIES.get(
+            ":".join(model.split(":")[:3]).lower()
+        )
 
     @staticmethod
     def _on_button_hover_enter(_motion, _x, _y, index, preview) -> None:
@@ -921,6 +1203,13 @@ class BetterUiApplication(Adw.Application):
                     RatbagdButton.ActionType.MACRO,
                     BetterUiApplication._CAPTURE_MACRO,
                     _("Record a macro…"),
+                )
+            )
+            actions.append(
+                (
+                    RatbagdButton.ActionType.MACRO,
+                    BetterUiApplication._CAPTURE_TOGGLE_HOLD,
+                    _("Hold a key until pressed again…"),
                 )
             )
         if RatbagdButton.ActionType.BUTTON in button.action_types:
@@ -1111,6 +1400,86 @@ class BetterUiApplication(Adw.Application):
             angle_row.connect("notify::active", self._on_angle_snapping_changed)
             group.add(angle_row)
         return group
+
+    def _onboard_memory_group(self, device: RatbagdDevice) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(title=_("Onboard memory"))
+        row = Adw.ActionRow(
+            title=_("Factory reset"),
+            subtitle=_(
+                "Replace every onboard profile with the defaults the mouse "
+                "shipped with. Virtual profiles in your library are kept."
+            ),
+        )
+        button = Gtk.Button(label=_("Reset…"), valign=Gtk.Align.CENTER)
+        button.add_css_class("destructive-action")
+        button.set_sensitive(self._pending_factory_reset is None)
+        button.connect("clicked", self._on_factory_reset_clicked, device)
+        row.add_suffix(button)
+        row.set_activatable_widget(button)
+        group.add(row)
+        return group
+
+    def _on_factory_reset_clicked(self, _button, device) -> None:
+        assert self._window is not None
+        dialog = Adw.MessageDialog(
+            transient_for=self._window,
+            heading=_("Reset onboard profiles?"),
+            body=_(
+                "All onboard profiles of {device} are overwritten with the "
+                "factory defaults and unapplied changes are discarded. Local "
+                "profile names for this mouse are removed; virtual profiles "
+                "are not affected."
+            ).format(device=device.name),
+        )
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("reset", _("Reset to factory defaults"))
+        dialog.set_close_response("cancel")
+        dialog.set_default_response("cancel")
+        dialog.set_response_appearance("reset", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", self._on_factory_reset_response, device)
+        dialog.present()
+
+    def _on_factory_reset_response(self, _dialog, response, device) -> None:
+        if response != "reset":
+            return
+        self._start_factory_reset(device)
+
+    def _start_factory_reset(self, device) -> None:
+        if self._pending_factory_reset is not None:
+            return
+        self._pending_factory_reset = device
+        self._set_apply_sensitive(False)
+        device.factory_reset(
+            lambda result, error: self._on_factory_reset_finished(
+                device, result, error
+            )
+        )
+
+    def _on_factory_reset_finished(self, device, result, error) -> None:
+        if self._pending_factory_reset is device:
+            self._pending_factory_reset = None
+        if error is not None:
+            if isinstance(error, RatbagCapabilityError):
+                message = _("This mouse does not support a factory reset")
+            elif isinstance(error, RatbagError):
+                message = _("The mouse rejected the factory reset: {}").format(error)
+            elif isinstance(error, RatbagdDBusTimeoutError):
+                message = _("The factory reset timed out; the mouse may be asleep")
+            else:
+                message = _(
+                    "The running ratbagd has no factory reset. "
+                    "Rebuild it with tools/install-ratbagd-piper.sh."
+                )
+            self._add_toast(message)
+            if device is self._selected_device:
+                self._show_device(device)
+            return
+        self._profile_names.clear_device(device)
+        self._device_drafts.pop(id(device), None)
+        if device is self._selected_device:
+            self._selected_profile = None
+            self._select_device(device)
+        self._add_toast(_("Onboard profiles restored to factory defaults"))
 
     def _profile_display_name(self, device, profile) -> str:
         return (
@@ -1341,7 +1710,7 @@ class BetterUiApplication(Adw.Application):
             virtual_name = virtual_profile["name"]
             if not isinstance(virtual_name, str) or not virtual_name.strip():
                 raise VirtualProfileError("This virtual profile has an invalid name")
-            apply_snapshot(virtual_profile["settings"], profile)
+            apply_virtual_profile(virtual_profile, device.model, profile)
             self._set_profile_name_from_virtual(device, profile, virtual_name)
         except (
             KeyError,
@@ -1382,8 +1751,12 @@ class BetterUiApplication(Adw.Application):
         if selected == Gtk.INVALID_LIST_POSITION:
             return
         action_type, value, _label = actions[selected]
-        if value in (self._CAPTURE_KEY, self._CAPTURE_MACRO):
-            self._open_button_capture(button, value is self._CAPTURE_MACRO)
+        if value in (self._CAPTURE_KEY, self._CAPTURE_MACRO, self._CAPTURE_TOGGLE_HOLD):
+            self._open_button_capture(
+                button,
+                value is self._CAPTURE_MACRO,
+                toggle_hold=value is self._CAPTURE_TOGGLE_HOLD,
+            )
             return
         try:
             if action_type == RatbagdButton.ActionType.BUTTON:
@@ -1404,21 +1777,28 @@ class BetterUiApplication(Adw.Application):
             dropdown.set_tooltip_text(None)
         self._set_apply_sensitive(True)
 
-    def _open_button_capture(self, button, capture_macro: bool) -> None:
+    def _open_button_capture(
+        self, button, capture_macro: bool, toggle_hold: bool = False
+    ) -> None:
         assert self._window is not None
         dialog = ButtonCaptureDialog(
             self._window,
             capture_macro,
             lambda action_type, value: self._on_button_capture_saved(
-                button, action_type, value
+                button, action_type, value, toggle_hold
             ),
             self._refresh_selected_device,
+            toggle_hold=toggle_hold,
         )
         dialog.present()
 
-    def _on_button_capture_saved(self, button, action_type, value) -> None:
+    def _on_button_capture_saved(
+        self, button, action_type, value, toggle_hold: bool = False
+    ) -> None:
         try:
-            if action_type == RatbagdButton.ActionType.KEY:
+            if toggle_hold and action_type == RatbagdButton.ActionType.KEY:
+                button.macro = RatbagdMacro.toggle_hold(value)
+            elif action_type == RatbagdButton.ActionType.KEY:
                 button.key = value
             else:
                 button.macro = value

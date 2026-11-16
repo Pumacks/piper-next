@@ -256,7 +256,7 @@ class _RatbagdDBus(GObject.GObject):
             print(e.message, file=sys.stderr)
             raise
 
-    def _dbus_call_async(self, method, type, *value, callback):
+    def _dbus_call_async(self, method, type, *value, callback, timeout_ms=2000):
         """Call a ratbagd method without blocking GTK's main loop.
 
         ``callback`` receives the result and an exception, respectively. This
@@ -284,7 +284,7 @@ class _RatbagdDBus(GObject.GObject):
             method,
             val,
             Gio.DBusCallFlags.NO_AUTO_START,
-            2000,
+            timeout_ms,
             None,
             on_call_finished,
             None,
@@ -459,6 +459,26 @@ class RatbagdDevice(_RatbagdDBus):
         device. No further interaction is required by the client.
         """
         self._dbus_call("Commit", "")
+
+    FACTORY_RESET_TIMEOUT_MS = 30000
+
+    def factory_reset(self, callback):
+        """Restores the onboard profiles to the factory defaults.
+
+        ratbagd rewrites the device synchronously, which can take a few
+        seconds, so the call is asynchronous. ``callback`` receives the
+        result (0 on success) and an exception, respectively. The exception is
+        a RatbagError subclass when the device rejected the reset, a
+        GLib.Error when the running ratbagd has no FactoryReset method, or a
+        RatbagdDBusTimeoutError. ratbagd emits Resync afterwards, so all
+        cached properties are refreshed by the time the callback runs.
+        """
+        self._dbus_call_async(
+            "FactoryReset",
+            "",
+            callback=callback,
+            timeout_ms=self.FACTORY_RESET_TIMEOUT_MS,
+        )
 
 
 class RatbagdProfile(_RatbagdDBus):
@@ -893,6 +913,10 @@ class RatbagdButton(_RatbagdDBus):
         KEY_PRESS = 1
         KEY_RELEASE = 2
         WAIT = 3
+        # Flow control stored in the device's onboard macro memory.
+        WAIT_FOR_RELEASE = 4
+        REPEAT_WHILE_PRESSED = 5
+        REPEAT_UNTIL_CANCELED = 6
 
     """A table mapping a button's index to its usual function as defined by X
     and the common desktop environments."""
@@ -1057,6 +1081,9 @@ class RatbagdMacro(GObject.Object):
         RatbagdButton.Macro.KEY_PRESS: lambda key: f"↓{evcode_to_str(key)}",
         RatbagdButton.Macro.KEY_RELEASE: lambda key: f"↑{evcode_to_str(key)}",
         RatbagdButton.Macro.WAIT: lambda val: f"{val}ms",
+        RatbagdButton.Macro.WAIT_FOR_RELEASE: lambda _val: "⏸release",
+        RatbagdButton.Macro.REPEAT_WHILE_PRESSED: lambda _val: "⟳held",
+        RatbagdButton.Macro.REPEAT_UNTIL_CANCELED: lambda _val: "⟳toggle",
         _MACRO_KEY: lambda key: f"↕{evcode_to_str(key)}",
     }
 
@@ -1095,6 +1122,24 @@ class RatbagdMacro(GObject.Object):
         """A list of (RatbagdButton.Macro.*, value) tuples representing the
         current macro."""
         return self._macro
+
+    @staticmethod
+    def toggle_hold(key):
+        """Return a macro that holds ``key`` down until the mouse button is
+        pressed a second time. ``key`` is an evdev code; BTN_LEFT and the
+        other BTN_* codes hold a mouse button instead of a keyboard key.
+
+        The device repeats the press until the toggle is cancelled; the
+        release after the repeat marker makes sure the key is let go of again.
+        """
+        return RatbagdMacro.from_ratbag(
+            [
+                (RatbagdButton.Macro.KEY_PRESS, key),
+                (RatbagdButton.Macro.WAIT, 50),
+                (RatbagdButton.Macro.REPEAT_UNTIL_CANCELED, 0),
+                (RatbagdButton.Macro.KEY_RELEASE, key),
+            ]
+        )
 
     @staticmethod
     def from_ratbag(macro):

@@ -1,0 +1,72 @@
+From cd7ed7a3adfebdae1c31666af5dc702ba17d9002 Mon Sep 17 00:00:00 2001
+From: DanielBeeck <daniel.beck99@outlook.de>
+Date: Fri, 13 Nov 2026 16:29:31 +0100
+Subject: [PATCH 2/6] ratbagd: rescan hidraw devices periodically after startup
+
+A wireless mouse that wakes up after ratbagd enumerated the devices does
+not always produce a new hidraw udev event. Rescan every 30 seconds so
+the device shows up once it answers again.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ ratbagd/ratbagd.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/ratbagd/ratbagd.c b/ratbagd/ratbagd.c
+index 52a3b28..41329d4 100644
+--- a/ratbagd/ratbagd.c
++++ b/ratbagd/ratbagd.c
+@@ -464,6 +464,27 @@ exit:
+ 	return r;
+ }
+ 
++static int ratbagd_retry_enumerate(sd_event_source *source,
++				  uint64_t usec,
++				  void *userdata)
++{
++	struct ratbagd *ctx = userdata;
++	uint64_t next;
++	int r;
++	(void)usec;
++
++	/* A wireless mouse can wake without a new hidraw udev event. */
++	log_verbose("Rescanning hidraw devices after wireless wake\n");
++	r = ratbagd_run_enumerate(ctx);
++	if (r < 0)
++		log_error("Failed to rescan devices: %s\n", strerror(-r));
++
++	r = sd_event_now(ctx->event, CLOCK_MONOTONIC, &next);
++	if (r < 0)
++		return r;
++	return sd_event_source_set_time(source, next + 30 * 1000000ULL);
++}
++
+ static int on_timeout_cb(sd_event_source *s, uint64_t usec, void *userdata)
+ {
+ 	log_info("Exiting after idle\n");
+@@ -495,12 +516,22 @@ static int sighandler(sd_event_source *source,
+ 
+ static int ratbagd_run(struct ratbagd *ctx)
+ {
++	uint64_t usec;
+ 	int r;
+ 
+ 	r = ratbagd_run_enumerate(ctx);
+ 	if (r < 0)
+ 		return r;
+ 
++	r = sd_event_now(ctx->event, CLOCK_MONOTONIC, &usec);
++	if (r < 0)
++		return r;
++	r = sd_event_add_time(ctx->event, NULL, CLOCK_MONOTONIC,
++			      usec + 30 * 1000000ULL, 1000000,
++			      ratbagd_retry_enumerate, ctx);
++	if (r < 0)
++		return r;
++
+ 	sigset_t sigset;
+ 	sigemptyset(&sigset);
+ 	sigaddset(&sigset, SIGINT);
+-- 
+2.56.0
+

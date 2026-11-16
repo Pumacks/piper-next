@@ -3,8 +3,10 @@
 """Command-line profile switching for launchers such as Steam."""
 
 import argparse
-import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -22,8 +24,13 @@ from .ratbagd import (
 from .virtualprofiles import (
     VirtualProfileError,
     VirtualProfileStore,
-    apply_snapshot,
+    apply_virtual_profile,
 )
+
+
+DEFAULT_WAIT_SECONDS = 45.0
+RETRY_INTERVAL_SECONDS = 2.0
+_UNSET = object()
 
 
 class ProfileCliError(Exception):
@@ -131,7 +138,7 @@ def activate_profile(
         target = device.profiles[slot - 1]
     virtual_profile = virtual[0]
     try:
-        apply_snapshot(virtual_profile["settings"], target)
+        apply_virtual_profile(virtual_profile, device.model, target)
         names.set(device, target, virtual_profile["name"])
         if not target.is_active:
             target.set_active()
@@ -184,6 +191,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--slot", type=int, help="Onboard slot for a virtual profile")
     parser.add_argument("--device", help="Substring of the device name, model, or ID")
     parser.add_argument(
+        "--restore",
+        metavar="PROFILE",
+        help="Profile to switch back to after the command exits",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=DEFAULT_WAIT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "Keep retrying for this long when ratbagd or the mouse is not "
+            "ready yet, for example because a wireless mouse is still asleep "
+            f"(default: {DEFAULT_WAIT_SECONDS:g})"
+        ),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="Do not launch the command when profile switching fails",
@@ -192,49 +215,202 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Errors that may clear up by themselves: ratbagd is still starting, the
+# wireless mouse has not answered yet, or a D-Bus call timed out.
+_TRANSIENT_ERRORS = (
+    ProfileCliError,
+    RatbagdDBusTimeoutError,
+    RatbagdUnavailableError,
+    RatbagError,
+    GLib.Error,
+)
+_FATAL_ERRORS = (RatbagdIncompatibleError, VirtualProfileError)
+
+
+def _open_device(ratbagd_api_version: int, selector: Optional[str]):
+    ratbag = Ratbagd(ratbagd_api_version)
+    return select_device(ratbag.devices, selector)
+
+
+def switch_with_retry(
+    selector: str,
+    args,
+    *,
+    ratbagd_api_version: int,
+    config_dir: Path,
+    deadline: float,
+    should_stop=lambda: False,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    open_device=None,
+    virtual_only=None,
+    slot=_UNSET,
+) -> str:
+    """Activate ``selector`` and retry transient failures until ``deadline``.
+
+    ``should_stop`` is polled between attempts so the loop ends early when
+    the launched game has already exited. Returns the activation message or
+    raises the last error.
+    """
+    open_device = open_device or (
+        lambda: _open_device(ratbagd_api_version, args.device)
+    )
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            device = open_device()
+            names = ProfileNameStore()
+            virtual_profiles = VirtualProfileStore(
+                config_dir / "virtual_profiles.json"
+            )
+            virtual_profiles.migrate_g502_profiles()
+            return activate_profile(
+                device,
+                selector,
+                names,
+                virtual_profiles,
+                virtual_only=args.virtual if virtual_only is None else virtual_only,
+                slot=args.slot if slot is _UNSET else slot,
+            )
+        except _FATAL_ERRORS:
+            raise
+        except _TRANSIENT_ERRORS as error:
+            remaining = deadline - monotonic()
+            if remaining <= 0 or should_stop():
+                raise
+            if attempt == 1:
+                print(
+                    f"piper-profile: {error}; retrying for up to "
+                    f"{remaining:.0f}s",
+                    file=sys.stderr,
+                )
+            sleep(min(RETRY_INTERVAL_SECONDS, max(remaining, 0.1)))
+
+
+def _run_command(command) -> int:
+    """Run the game and return its exit code, forwarding termination signals."""
+    try:
+        child = subprocess.Popen(command)
+    except OSError as error:
+        print(
+            f"piper-profile: could not launch {command[0]!r}: {error}",
+            file=sys.stderr,
+        )
+        return 127
+    return _wait_for_child(child)
+
+
+def _switch(
+    selector,
+    args,
+    ratbagd_api_version,
+    config_dir,
+    deadline,
+    should_stop,
+    *,
+    restoring=False,
+):
+    try:
+        message = switch_with_retry(
+            selector,
+            args,
+            ratbagd_api_version=ratbagd_api_version,
+            config_dir=config_dir,
+            deadline=deadline,
+            should_stop=should_stop,
+            # The desktop profile may be onboard or virtual; let the normal
+            # name matching decide instead of the game's --virtual/--slot.
+            virtual_only=False if restoring else None,
+            slot=None if restoring else _UNSET,
+        )
+    except (_FATAL_ERRORS, _TRANSIENT_ERRORS) as error:
+        print(f"piper-profile: {error}", file=sys.stderr)
+        return False
+    print(message, file=sys.stderr)
+    return True
+
+
 def main(ratbagd_api_version: int, argv=None) -> int:
     args = _parser().parse_args(argv)
     command = args.command
     if command and command[0] == "--":
         command = command[1:]
     config_dir = Path(GLib.get_user_config_dir()) / "piper"
-    try:
-        ratbag = Ratbagd(ratbagd_api_version)
-        device = select_device(ratbag.devices, args.device)
-        names = ProfileNameStore()
-        virtual_profiles = VirtualProfileStore(config_dir / "virtual_profiles.json")
-        if args.list:
-            print(list_profiles(device, names, virtual_profiles))
-        else:
-            message = activate_profile(
-                device,
-                args.profile,
-                names,
-                virtual_profiles,
-                virtual_only=args.virtual,
-                slot=args.slot,
-            )
-            print(message, file=sys.stderr)
-    except (
-        ProfileCliError,
-        RatbagdIncompatibleError,
-        RatbagdDBusTimeoutError,
-        RatbagdUnavailableError,
-        RatbagError,
-        VirtualProfileError,
-        GLib.Error,
-    ) as error:
-        print(f"piper-profile: {error}", file=sys.stderr)
-        if args.strict or not command:
-            return 1
 
-    if command:
+    if args.list:
         try:
-            os.execvp(command[0], command)
+            device = _open_device(ratbagd_api_version, args.device)
+            names = ProfileNameStore()
+            virtual_profiles = VirtualProfileStore(
+                config_dir / "virtual_profiles.json"
+            )
+            virtual_profiles.migrate_g502_profiles()
+            print(list_profiles(device, names, virtual_profiles))
+        except (_FATAL_ERRORS, _TRANSIENT_ERRORS) as error:
+            print(f"piper-profile: {error}", file=sys.stderr)
+            return 1
+        return 0
+
+    if not command:
+        deadline = time.monotonic() + args.wait
+        return 0 if _switch(args.profile, args, ratbagd_api_version, config_dir, deadline, lambda: False) else 1
+
+    if args.strict:
+        # The game may only start once the profile is active.
+        deadline = time.monotonic() + args.wait
+        if not _switch(args.profile, args, ratbagd_api_version, config_dir, deadline, lambda: False):
+            return 1
+        exit_code = _run_command(command)
+    else:
+        # Start the game right away and switch the profile alongside it, so a
+        # mouse that is still waking up does not delay or block the launch.
+        try:
+            child = subprocess.Popen(command)
         except OSError as error:
             print(
                 f"piper-profile: could not launch {command[0]!r}: {error}",
                 file=sys.stderr,
             )
-            return 1
-    return 0
+            return 127
+        deadline = time.monotonic() + args.wait
+        _switch(
+            args.profile,
+            args,
+            ratbagd_api_version,
+            config_dir,
+            deadline,
+            lambda: child.poll() is not None,
+        )
+        exit_code = _wait_for_child(child)
+
+    if args.restore:
+        deadline = time.monotonic() + args.wait
+        _switch(
+            args.restore,
+            args,
+            ratbagd_api_version,
+            config_dir,
+            deadline,
+            lambda: False,
+            restoring=True,
+        )
+    return exit_code
+
+
+def _wait_for_child(child) -> int:
+    def forward(signum, _frame):
+        try:
+            child.send_signal(signum)
+        except OSError:
+            pass
+
+    previous = {
+        signum: signal.signal(signum, forward)
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    }
+    try:
+        return child.wait()
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)

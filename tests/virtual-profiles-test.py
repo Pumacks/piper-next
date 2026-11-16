@@ -8,12 +8,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from piper.ratbagd import RatbagdButton, RatbagdResolution  # noqa: E402
+from piper.ratbagd import RatbagdButton, RatbagdMacro, RatbagdResolution  # noqa: E402
 from piper.profilenames import ProfileNameStore  # noqa: E402
 from piper.virtualprofiles import (
     VirtualProfileError,
     VirtualProfileStore,
     apply_snapshot,
+    apply_virtual_profile,
     snapshot_profile,
 )  # noqa: E402
 
@@ -96,6 +97,25 @@ class VirtualProfileTest(unittest.TestCase):
         self.assertEqual(target.leds[0].color, (10, 20, 30))
         self.assertEqual(target.name, "Onboard")
 
+    def test_toggle_hold_macro_wraps_a_mouse_button_in_a_repeat(self):
+        from evdev import ecodes
+
+        macro = RatbagdMacro.toggle_hold(ecodes.BTN_LEFT)
+
+        self.assertEqual(
+            [event[0] for event in macro.keys],
+            [
+                RatbagdButton.Macro.KEY_PRESS,
+                RatbagdButton.Macro.WAIT,
+                RatbagdButton.Macro.REPEAT_UNTIL_CANCELED,
+                RatbagdButton.Macro.KEY_RELEASE,
+            ],
+        )
+        self.assertEqual(macro.keys[0][1], ecodes.BTN_LEFT)
+        self.assertEqual(macro.keys[-1][1], ecodes.BTN_LEFT)
+        self.assertIn("BTN_LEFT", str(macro))
+        self.assertIn("⟳toggle", str(macro))
+
     def test_incompatible_layout_is_rejected_before_changes(self):
         source = FakeProfile()
         settings = snapshot_profile(source)
@@ -120,6 +140,50 @@ class VirtualProfileTest(unittest.TestCase):
             store.delete(saved["id"])
             self.assertEqual(store.list_for_model("g502"), [])
             self.assertEqual(json.loads(path.read_text())["version"], 1)
+
+    def test_old_g502_profiles_are_copied_for_both_g502_x_connections(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "virtual_profiles.json"
+            store = VirtualProfileStore(path)
+            source = store.save("Desktop", "usb:046d:407f:0", FakeProfile())
+            store.migrate_g502_profiles()
+            store.migrate_g502_profiles()
+
+            wired = store.list_for_model("usb:046d:c098:0")
+            wireless = store.list_for_model("usb:046d:409f:0")
+
+            self.assertEqual(len(wired), 1)
+            self.assertEqual(wired, wireless)
+            self.assertNotEqual(wired[0]["id"], source["id"])
+            self.assertEqual(wired[0]["migrated_from_id"], source["id"])
+            self.assertEqual(len(store.list_for_model("usb:046d:407f:0")), 1)
+            self.assertEqual(len(store.list_for_model("usb:046d:c08d:0")), 1)
+            self.assertEqual(len(json.loads(path.read_text())["profiles"]), 2)
+
+    def test_old_g502_profile_keeps_its_lighting(self):
+        source = FakeProfile()
+        source.leds[0].color = (1, 2, 3)
+        saved = {"settings": snapshot_profile(source)}
+        target = FakeProfile()
+
+        apply_virtual_profile(saved, "usb:046d:407f:0", target)
+
+        self.assertEqual(target.leds[0].color, (1, 2, 3))
+
+    def test_migrated_g502_profile_keeps_target_lighting(self):
+        source = FakeProfile()
+        source.buttons[0].mapping = 2
+        migrated = {
+            "migrated_from_model": "usb:046d:407f:0",
+            "settings": snapshot_profile(source),
+        }
+        target = FakeProfile()
+        target.leds = []
+
+        apply_virtual_profile(migrated, "usb:046d:409f:0", target)
+
+        self.assertEqual(target.buttons[0].mapping, 2)
+        self.assertEqual(target.leds, [])
 
     def test_local_profile_names_are_persistent_and_slot_specific(self):
         with tempfile.TemporaryDirectory() as directory:

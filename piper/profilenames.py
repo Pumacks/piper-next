@@ -9,6 +9,10 @@ from typing import Optional
 from gi.repository import GLib
 
 
+class _AnyProfile:
+    index = 0
+
+
 class ProfileNameStore:
     """Store profile aliases for devices that cannot persist names in firmware."""
 
@@ -38,6 +42,19 @@ class ProfileNameStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("w", encoding="utf-8") as aliases_file:
             json.dump(aliases, aliases_file, indent=2, sort_keys=True)
+
+    def clear_device(self, device) -> None:
+        """Forget all local profile names of ``device``."""
+        prefix = self._key(device, _AnyProfile()).rsplit(":", 1)[0] + ":"
+        aliases = self._load()
+        remaining = {
+            key: value for key, value in aliases.items() if not key.startswith(prefix)
+        }
+        if len(remaining) == len(aliases):
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with self._path.open("w", encoding="utf-8") as aliases_file:
+            json.dump(remaining, aliases_file, indent=2, sort_keys=True)
 
     def _load(self) -> dict:
         if not self._path.exists():

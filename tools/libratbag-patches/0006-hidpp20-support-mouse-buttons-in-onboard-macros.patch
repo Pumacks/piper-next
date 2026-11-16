@@ -1,0 +1,103 @@
+From 85c00fd28abdf09afadc3c1c8290044f0c3d3b1b Mon Sep 17 00:00:00 2001
+From: DanielBeeck <daniel.beck99@outlook.de>
+Date: Fri, 13 Nov 2026 21:23:05 +0100
+Subject: [PATCH 6/6] hidpp20: support mouse buttons in onboard macros
+
+BTN_LEFT .. BTN_TASK in a macro become the firmware's button down/up
+commands with the matching button bit, and are read back the same way, so
+a macro can hold or click a mouse button.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ src/driver-hidpp20.c | 38 +++++++++++++++++++++++++++++++++++++-
+ src/hidpp20.h        |  4 ++++
+ 2 files changed, 41 insertions(+), 1 deletion(-)
+
+diff --git a/src/driver-hidpp20.c b/src/driver-hidpp20.c
+index 2731346..3c653b2 100644
+--- a/src/driver-hidpp20.c
++++ b/src/driver-hidpp20.c
+@@ -133,6 +133,16 @@ hidpp20drv_read_macro_key_8100(struct ratbag_device *device, union hidpp20_macro
+ 	return ratbag_hidraw_get_keycode_from_keyboard_usage(device, macro->key.key);
+ }
+ 
++/* BTN_LEFT .. BTN_TASK map to mouse buttons 1 .. 8 in macros */
++#define HIDPP20_MACRO_MAX_MOUSE_BUTTONS 8
++
++static bool
++hidpp20drv_macro_is_mouse_button(unsigned int keycode)
++{
++	return keycode >= BTN_LEFT &&
++	       keycode < BTN_LEFT + HIDPP20_MACRO_MAX_MOUSE_BUTTONS;
++}
++
+ static uint8_t
+ hidpp20drv_macro_modifier_mask_8100(unsigned int keycode)
+ {
+@@ -184,6 +194,11 @@ hidpp20drv_write_macro_8100(struct ratbag_button *button,
+ 		case RATBAG_MACRO_EVENT_KEY_PRESSED:
+ 		case RATBAG_MACRO_EVENT_KEY_RELEASED:
+ 			press = event->type == RATBAG_MACRO_EVENT_KEY_PRESSED;
++			if (hidpp20drv_macro_is_mouse_button(event->event.key)) {
++				item->button.type = press ? HIDPP20_MACRO_BUTTON_DOWN : HIDPP20_MACRO_BUTTON_UP;
++				item->button.buttons = hidpp_cpu_to_be_u16(1u << (event->event.key - BTN_LEFT));
++				break;
++			}
+ 			modifier = hidpp20drv_macro_modifier_mask_8100(event->event.key);
+ 			if (modifier) {
+ 				item->key.type = press ? HIDPP20_MACRO_KEY_PRESS : HIDPP20_MACRO_KEY_RELEASE;
+@@ -301,6 +316,27 @@ hidpp20drv_read_macro_8100(struct ratbag_button *button,
+ 						      keycode);
+ 			delay = false;
+ 			break;
++		case HIDPP20_MACRO_BUTTON_DOWN:
++		case HIDPP20_MACRO_BUTTON_UP: {
++			uint16_t mask = hidpp_be_u16_to_cpu(macro->button.buttons);
++
++			if (mask == 0 || ffs(mask) > HIDPP20_MACRO_MAX_MOUSE_BUTTONS)
++				break;
++			keycode = BTN_LEFT + ffs(mask) - 1;
++			if (!delay)
++				ratbag_button_macro_set_event(m,
++							      i++,
++							      RATBAG_MACRO_EVENT_WAIT,
++							      1);
++			ratbag_button_macro_set_event(m,
++						      i++,
++						      macro->any.type == HIDPP20_MACRO_BUTTON_DOWN ?
++							RATBAG_MACRO_EVENT_KEY_PRESSED :
++							RATBAG_MACRO_EVENT_KEY_RELEASED,
++						      keycode);
++			delay = false;
++			break;
++		}
+ 		case HIDPP20_MACRO_WAIT_FOR_RELEASE:
+ 			ratbag_button_macro_set_event(m, i++,
+ 						      RATBAG_MACRO_EVENT_WAIT_FOR_RELEASE, 0);
+@@ -679,7 +715,7 @@ hidpp20drv_update_button_8100(struct ratbag_button *button)
+ 		rc = ratbag_action_keycode_from_macro(action,
+ 						      &key,
+ 						      &modifiers);
+-		if (rc != 1) {
++		if (rc != 1 || hidpp20drv_macro_is_mouse_button(key)) {
+ 			/* not a plain key with modifiers: store it in the
+ 			 * onboard macro memory */
+ 			rc = hidpp20drv_write_macro_8100(button, profile);
+diff --git a/src/hidpp20.h b/src/hidpp20.h
+index 2c6bb64..1af97c6 100644
+--- a/src/hidpp20.h
++++ b/src/hidpp20.h
+@@ -948,6 +948,10 @@ union hidpp20_macro_data {
+ 		uint8_t type; /* HIDPP20_MACRO_CONS_DOWN or HIDPP20_MACRO_CONS_UP */
+ 		uint16_t usage; /* big endian, as on the device */
+ 	} __attribute__((packed)) consumer;
++	struct {
++		uint8_t type; /* HIDPP20_MACRO_BUTTON_DOWN or HIDPP20_MACRO_BUTTON_UP */
++		uint16_t buttons; /* big endian bitmask, bit 0 is button 1 */
++	} __attribute__((packed)) button;
+ 	struct {
+ 		uint8_t type; /* HIDPP20_MACRO_END */
+ 	} __attribute__((packed)) end;
+-- 
+2.56.0
+

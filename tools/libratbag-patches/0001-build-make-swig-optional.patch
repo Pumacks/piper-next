@@ -1,0 +1,38 @@
+From 6155df81a81cabf41e4712655a8a2354d7f1ebef Mon Sep 17 00:00:00 2001
+From: DanielBeeck <daniel.beck99@outlook.de>
+Date: Fri, 13 Nov 2026 16:29:30 +0100
+Subject: [PATCH 1/6] build: make swig optional
+
+The swig bindings are only needed for the ratbag-command developer tool.
+Allow building ratbagd and the libraries on hosts without swig.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ meson.build | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/meson.build b/meson.build
+index 73771e5..ad51814 100644
+--- a/meson.build
++++ b/meson.build
+@@ -578,7 +578,8 @@ test(
+ )
+ 
+ # ratbag-command uses Swig bindings to call libratbag directly
+-swig = find_program('swig')
++swig = find_program('swig', required: false)
++if swig.found()
+ swig_gen = generator(
+     swig,
+     output: ['@BASENAME@.c'],
+@@ -644,6 +645,7 @@ custom_target('ratbag-command',
+ 				'@INPUT@',
+ 				'--output', '@OUTPUT@'],
+   install: false)
++endif
+ 
+ #### output files ####
+ configure_file(output: 'config.h', install: false, configuration: config_h)
+-- 
+2.56.0
+

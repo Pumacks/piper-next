@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import uuid
+from copy import deepcopy
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,6 +12,18 @@ from .ratbagd import RatbagdButton, RatbagdLed, RatbagdMacro, RatbagdProfile
 
 
 FORMAT_VERSION = 1
+G502_X_MODELS = {"usb:046d:c098:0", "usb:046d:409f:0"}
+G502_OLD_MODELS = {"usb:046d:407f:0", "usb:046d:c08d:0"}
+G502_X_PROFILE_MODEL = "usb:046d:c098:0"
+G502_OLD_PROFILE_MODEL = "usb:046d:407f:0"
+
+
+def _profile_model(model: Optional[str]) -> Optional[str]:
+    if model in G502_X_MODELS:
+        return G502_X_PROFILE_MODEL
+    if model in G502_OLD_MODELS:
+        return G502_OLD_PROFILE_MODEL
+    return model
 
 
 class VirtualProfileError(Exception):
@@ -24,14 +37,17 @@ class VirtualProfileStore:
         self.path = path
 
     def list_for_model(self, model: str) -> List[dict]:
-        return [p for p in self._load() if p.get("device_model") == model]
+        model = _profile_model(model)
+        return [
+            p for p in self._load() if _profile_model(p.get("device_model")) == model
+        ]
 
     def save(self, name: str, model: str, profile: RatbagdProfile) -> dict:
         profiles = self._load()
         virtual_profile = {
             "id": str(uuid.uuid4()),
             "name": name,
-            "device_model": model,
+            "device_model": _profile_model(model),
             "settings": snapshot_profile(profile),
         }
         profiles.append(virtual_profile)
@@ -41,6 +57,25 @@ class VirtualProfileStore:
     def delete(self, profile_id: str) -> None:
         profiles = [p for p in self._load() if p.get("id") != profile_id]
         self._write(profiles)
+
+    def migrate_g502_profiles(self) -> None:
+        profiles = self._load()
+        migrated_ids = {p.get("migrated_from_id") for p in profiles}
+        copies = []
+        for source in profiles:
+            if (
+                source.get("device_model") not in G502_OLD_MODELS
+                or source.get("id") in migrated_ids
+            ):
+                continue
+            copy = deepcopy(source)
+            copy["id"] = str(uuid.uuid4())
+            copy["device_model"] = G502_X_PROFILE_MODEL
+            copy["migrated_from_id"] = source["id"]
+            copy["migrated_from_model"] = source["device_model"]
+            copies.append(copy)
+        if copies:
+            self._write(profiles + copies)
 
     def _load(self) -> List[dict]:
         if not self.path.exists():
@@ -136,6 +171,20 @@ def snapshot_profile(profile: RatbagdProfile) -> dict:
         "buttons": buttons,
         "leds": leds,
     }
+
+
+def apply_virtual_profile(
+    virtual_profile: dict, model: str, profile: RatbagdProfile
+) -> None:
+    """Load a saved profile, adapting old G502 lighting to the G502 X."""
+    settings = virtual_profile["settings"]
+    if (
+        model in G502_X_MODELS
+        and virtual_profile.get("migrated_from_model") in G502_OLD_MODELS
+    ):
+        settings = deepcopy(settings)
+        settings["leds"] = snapshot_profile(profile)["leds"]
+    apply_snapshot(settings, profile)
 
 
 def apply_snapshot(settings: dict, profile: RatbagdProfile) -> None:

@@ -33,6 +33,12 @@ class TestSVGLookup(unittest.TestCase):
             self.assertNotIn(match, d, msg=f'Duplicate match "{match}"')
             d[match] = True
 
+    def test_g502_x_lightspeed_artwork(self):
+        device = config["Logitech G502 X Wireless"]
+        self.assertEqual(device["Svg"], "logitech-g502-x.svg")
+        self.assertIn("usb:046d:c098", device["DeviceMatch"].split(";"))
+        self.assertIn("usb:046d:409f", device["DeviceMatch"].split(";"))
+
 
 def setUpModule():
     global config, path
