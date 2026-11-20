@@ -169,6 +169,40 @@ class VirtualProfileTest(unittest.TestCase):
 
             self.assertEqual(store.list_for_model("usb:046d:409f:0"), [native])
 
+    def test_applied_slot_edits_reach_the_matching_virtual_profile(self):
+        # Regression: launchers reload the snapshot on every game start, so
+        # button changes applied to the slot must be stored in it.
+        with tempfile.TemporaryDirectory() as directory:
+            store = VirtualProfileStore(Path(directory) / "virtual_profiles.json")
+            store.save("DayZ", "usb:046d:407f:0", FakeProfile())
+            store.save("Desktop", "usb:046d:407f:0", FakeProfile())
+            store.migrate_g502_profiles()
+            slot = FakeProfile()
+            slot.buttons[0].mapping = 5
+
+            synced = store.sync_from_slot("dayz", "usb:046d:409f:0", slot)
+
+            self.assertEqual(synced["name"], "DayZ")
+            self.assertNotIn("migrated_from_model", synced)
+            reloaded = store.find_by_name("usb:046d:c098:0", "DayZ")
+            self.assertEqual(len(reloaded), 1)
+            self.assertEqual(reloaded[0]["settings"]["buttons"][0]["value"], 5)
+            desktop = store.find_by_name("usb:046d:c098:0", "Desktop")[0]
+            self.assertEqual(desktop["settings"]["buttons"][0]["value"], 1)
+            # The old G502 keeps its own copy.
+            old = store.find_by_name("usb:046d:407f:0", "DayZ")[0]
+            self.assertEqual(old["settings"]["buttons"][0]["value"], 1)
+            # Migration must not bring the old copy back as a duplicate.
+            store.migrate_g502_profiles()
+            self.assertEqual(len(store.find_by_name("usb:046d:409f:0", "DayZ")), 1)
+
+    def test_slot_without_matching_virtual_profile_is_not_synced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = VirtualProfileStore(Path(directory) / "virtual_profiles.json")
+            store.save("Work", "g502", FakeProfile())
+
+            self.assertIsNone(store.sync_from_slot("Profile 1", "g502", FakeProfile()))
+
     def test_old_g502_profile_keeps_its_lighting(self):
         source = FakeProfile()
         source.leds[0].color = (1, 2, 3)

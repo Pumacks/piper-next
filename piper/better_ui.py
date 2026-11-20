@@ -1958,7 +1958,25 @@ class BetterUiApplication(Adw.Application):
             return
 
         self._set_apply_sensitive(False)
-        self._add_toast(_("Changes applied"))
+        try:
+            synced = self._virtual_profiles.sync_from_slot(
+                name, self._selected_device.model, profile
+            )
+        except VirtualProfileError as error:
+            self._add_toast(
+                _("Changes applied, but the virtual profile was not updated: {}").format(
+                    error
+                )
+            )
+        else:
+            if synced is None:
+                self._add_toast(_("Changes applied"))
+            else:
+                self._add_toast(
+                    _("Changes applied and saved to virtual profile {}").format(
+                        synced["name"]
+                    )
+                )
         self._show_device(self._selected_device)
 
     def _set_apply_sensitive(self, sensitive: bool) -> None:

@@ -54,6 +54,52 @@ class VirtualProfileStore:
         self._write(profiles)
         return virtual_profile
 
+    def find_by_name(self, model: str, name: str) -> List[dict]:
+        """Return the profiles of ``model`` called ``name`` (case-insensitive).
+
+        A profile saved on this model wins over a copy migrated from an older
+        model that happens to share its name.
+        """
+        needle = name.strip().casefold()
+        matches = [
+            p
+            for p in self.list_for_model(model)
+            if isinstance(p.get("name"), str) and p["name"].casefold() == needle
+        ]
+        native = [p for p in matches if "migrated_from_id" not in p]
+        return native or matches
+
+    def update(self, profile_id: str, model: str, profile: RatbagdProfile) -> dict:
+        """Replace the settings of a saved profile with ``profile``'s current ones."""
+        profiles = self._load()
+        for virtual_profile in profiles:
+            if virtual_profile.get("id") == profile_id:
+                break
+        else:
+            raise VirtualProfileError("This virtual profile no longer exists")
+        virtual_profile["device_model"] = _profile_model(model)
+        virtual_profile["settings"] = snapshot_profile(profile)
+        # The snapshot now comes from this model, including its lighting, so
+        # it must no longer be treated as a copy from an older mouse.
+        virtual_profile.pop("migrated_from_model", None)
+        virtual_profile.pop("migrated_from_id", None)
+        self._write(profiles)
+        return virtual_profile
+
+    def sync_from_slot(
+        self, name: str, model: str, profile: RatbagdProfile
+    ) -> Optional[dict]:
+        """Store ``profile`` in the virtual profile called ``name``, if any.
+
+        Launchers load virtual profiles into onboard slots, so edits applied
+        to such a slot must reach the snapshot or the next launch reverts them.
+        Returns the updated profile, or None when no single profile matches.
+        """
+        matches = self.find_by_name(model, name)
+        if len(matches) != 1:
+            return None
+        return self.update(matches[0]["id"], model, profile)
+
     def delete(self, profile_id: str) -> None:
         profiles = [p for p in self._load() if p.get("id") != profile_id]
         self._write(profiles)
